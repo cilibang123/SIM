@@ -73,13 +73,6 @@ import type {
   ApnContext,
 } from '../api/types'
 
-// UDX710 设备支持的频段列表
-const LTE_FDD_BANDS = [1, 3, 5, 8]
-const LTE_TDD_BANDS = [39, 41]
-const NR_FDD_BANDS = [1, 3, 28]
-const NR_TDD_BANDS = [41, 77, 78, 79]
-const BAND_LOCK_CONFIG_STORAGE_KEY = 'network-band-lock-config'
-
 type BandLockMode = 'unlocked' | 'custom'
 
 interface SavedBandLockConfig extends BandLockRequest {
@@ -99,27 +92,37 @@ function normalizeBandList(value: unknown): number[] {
   return value.filter((band): band is number => Number.isInteger(band))
 }
 
-function readSavedBandLockConfig(): SavedBandLockConfig | null {
-  try {
-    const raw = localStorage.getItem(BAND_LOCK_CONFIG_STORAGE_KEY)
-    if (!raw) return null
-    const parsed = JSON.parse(raw) as Partial<SavedBandLockConfig>
-    const mode = parsed.mode === 'custom' ? 'custom' : 'unlocked'
-    return {
-      mode,
-      lte_fdd_bands: normalizeBandList(parsed.lte_fdd_bands),
-      lte_tdd_bands: normalizeBandList(parsed.lte_tdd_bands),
-      nr_fdd_bands: normalizeBandList(parsed.nr_fdd_bands),
-      nr_tdd_bands: normalizeBandList(parsed.nr_tdd_bands),
-    }
-  } catch {
-    localStorage.removeItem(BAND_LOCK_CONFIG_STORAGE_KEY)
-    return null
+function bandLockStatusToConfig(status: BandLockStatus): SavedBandLockConfig {
+  if (!status.locked) return EMPTY_BAND_LOCK_CONFIG
+  return {
+    mode: 'custom',
+    lte_fdd_bands: normalizeBandList(status.lte_fdd_bands),
+    lte_tdd_bands: normalizeBandList(status.lte_tdd_bands),
+    nr_fdd_bands: normalizeBandList(status.nr_fdd_bands),
+    nr_tdd_bands: normalizeBandList(status.nr_tdd_bands),
   }
 }
 
-function saveBandLockConfig(config: SavedBandLockConfig) {
-  localStorage.setItem(BAND_LOCK_CONFIG_STORAGE_KEY, JSON.stringify(config))
+function supportedBandLockConfig(status: BandLockStatus | null): SavedBandLockConfig {
+  if (!status) return EMPTY_BAND_LOCK_CONFIG
+  return {
+    mode: 'custom',
+    lte_fdd_bands: normalizeBandList(status.supported_lte_fdd_bands ?? status.lte_fdd_bands),
+    lte_tdd_bands: normalizeBandList(status.supported_lte_tdd_bands ?? status.lte_tdd_bands),
+    nr_fdd_bands: normalizeBandList(status.supported_nr_fdd_bands ?? status.nr_fdd_bands),
+    nr_tdd_bands: normalizeBandList(status.supported_nr_tdd_bands ?? status.nr_tdd_bands),
+  }
+}
+
+function formatBandSummary(status: BandLockStatus | null): string {
+  if (!status) return 'modem 报告的全部支持频段'
+  const bands = [
+    ...normalizeBandList(status.supported_lte_fdd_bands ?? status.lte_fdd_bands).map((band) => `B${band}`),
+    ...normalizeBandList(status.supported_lte_tdd_bands ?? status.lte_tdd_bands).map((band) => `B${band}`),
+    ...normalizeBandList(status.supported_nr_fdd_bands ?? status.nr_fdd_bands).map((band) => `n${band}`),
+    ...normalizeBandList(status.supported_nr_tdd_bands ?? status.nr_tdd_bands).map((band) => `n${band}`),
+  ]
+  return bands.length > 0 ? bands.join(', ') : 'modem 报告的全部支持频段'
 }
 
 function networkActionError(err: unknown, fallback: string): string {
@@ -185,7 +188,7 @@ export default function NetworkPage() {
   const [lteTddBands, setLteTddBands] = useState<number[]>([])
   const [nrFddBands, setNrFddBands] = useState<number[]>([])
   const [nrTddBands, setNrTddBands] = useState<number[]>([])
-  const [_bandLockStatus, setBandLockStatus] = useState<BandLockStatus | null>(null)
+  const [bandLockStatus, setBandLockStatus] = useState<BandLockStatus | null>(null)
   const [modeLoading, setModeLoading] = useState(false)
   const [bandLoading, setBandLoading] = useState(false)
   
@@ -213,6 +216,19 @@ export default function NetworkPage() {
     setNrTddBands(config.nr_tdd_bands)
   }
 
+  const supportedBandOptions = useMemo(
+    () => supportedBandLockConfig(bandLockStatus),
+    [bandLockStatus],
+  )
+
+  const handleBandLockModeChange = (mode: BandLockMode) => {
+    if (mode === 'custom' && lockMode === 'unlocked') {
+      applyBandLockConfigToState(supportedBandOptions)
+      return
+    }
+    setLockMode(mode)
+  }
+
   // 加载频段锁定配置（只在首次加载和手动刷新时调用，自动刷新不调用）
   const loadBandLockConfig = async () => {
     try {
@@ -231,7 +247,7 @@ export default function NetworkPage() {
       
       if (bandLockRes.data) {
         setBandLockStatus(bandLockRes.data)
-        applyBandLockConfigToState(readSavedBandLockConfig() ?? EMPTY_BAND_LOCK_CONFIG)
+        applyBandLockConfigToState(bandLockStatusToConfig(bandLockRes.data))
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
@@ -522,10 +538,6 @@ export default function NetworkPage() {
     try {
       const response = await api.setBandLock(request)
       void response
-      saveBandLockConfig({
-        mode: lockMode,
-        ...request,
-      })
       setSuccess(lockMode === 'unlocked' ? '已取消频段限制，所有频段可用' : '频段锁定配置已应用')
       // 1秒后刷新频段锁定状态
       setTimeout(() => void loadBandLockConfig(), 1000)
@@ -549,7 +561,6 @@ export default function NetworkPage() {
     try {
       const response = await api.setBandLock(request)
       void response
-      saveBandLockConfig(EMPTY_BAND_LOCK_CONFIG)
       setLockMode('unlocked')
       setSuccess('已取消频段限制，所有频段可用')
       // 清空本地复选框状态
@@ -1126,14 +1137,6 @@ export default function NetworkPage() {
             </Button>
           </Box>
           <CardContent sx={{ pt: 0, px: { xs: 1.5, sm: 2 } }}>
-            <Alert severity="info" sx={{ mb: 1.5 }}>
-              <Typography variant="body2" component="div">
-                <strong>验证说明：</strong>
-                「应用」会调用 ModemManager 的 SetCurrentBands 限制允许频段；是否生效取决于模组固件/QMI 是否支持写入。
-                「取消限制」会把 CurrentBands 恢复为 Modem 报告的 SupportedBands 全集。
-                若应用后频段或小区列表几乎不变，多为驱动不支持；可在设备上用 mmcli（如查看 modem-capabilities / CurrentBands）与 ModemManager 日志核对。
-              </Typography>
-            </Alert>
             {/* 射频模式切换 */}
             <Box mb={2}>
               <Typography variant="caption" color="text.secondary" gutterBottom display="block">射频模式</Typography>
@@ -1175,7 +1178,7 @@ export default function NetworkPage() {
                   label="未锁定（使用所有频段）"
                   size="small"
                   color={lockMode === 'unlocked' ? 'success' : 'default'}
-                  onClick={() => setLockMode('unlocked')}
+                  onClick={() => handleBandLockModeChange('unlocked')}
                   disabled={bandLoading}
                   icon={lockMode === 'unlocked' ? <LockOpen /> : undefined}
                 />
@@ -1183,7 +1186,7 @@ export default function NetworkPage() {
                   label="自定义锁定（选择允许的频段）"
                   size="small"
                   color={lockMode === 'custom' ? 'warning' : 'default'}
-                  onClick={() => setLockMode('custom')}
+                  onClick={() => handleBandLockModeChange('custom')}
                   disabled={bandLoading}
                   icon={lockMode === 'custom' ? <Lock /> : undefined}
                 />
@@ -1199,7 +1202,7 @@ export default function NetworkPage() {
               <Grid size={{ xs: 6, sm: 3 }}>
                 <Typography variant="caption" color="text.secondary" gutterBottom display="block">LTE FDD (允许)</Typography>
                 <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0 }}>
-                  {LTE_FDD_BANDS.map((band) => (
+                  {supportedBandOptions.lte_fdd_bands.length > 0 ? supportedBandOptions.lte_fdd_bands.map((band) => (
                     <FormControlLabel
                       key={`lte-fdd-${band}`}
                       control={
@@ -1213,7 +1216,7 @@ export default function NetworkPage() {
                       label={<Typography variant="caption">B{band}</Typography>}
                       sx={{ mr: 0.5, ml: 0 }}
                     />
-                  ))}
+                  )) : <Typography variant="caption" color="text.disabled">无</Typography>}
                 </Box>
               </Grid>
 
@@ -1221,7 +1224,7 @@ export default function NetworkPage() {
               <Grid size={{ xs: 6, sm: 3 }}>
                 <Typography variant="caption" color="text.secondary" gutterBottom display="block">LTE TDD (允许)</Typography>
                 <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0 }}>
-                  {LTE_TDD_BANDS.map((band) => (
+                  {supportedBandOptions.lte_tdd_bands.length > 0 ? supportedBandOptions.lte_tdd_bands.map((band) => (
                     <FormControlLabel
                       key={`lte-tdd-${band}`}
                       control={
@@ -1235,7 +1238,7 @@ export default function NetworkPage() {
                       label={<Typography variant="caption">B{band}</Typography>}
                       sx={{ mr: 0.5, ml: 0 }}
                     />
-                  ))}
+                  )) : <Typography variant="caption" color="text.disabled">无</Typography>}
                 </Box>
               </Grid>
 
@@ -1243,7 +1246,7 @@ export default function NetworkPage() {
               <Grid size={{ xs: 6, sm: 3 }}>
                 <Typography variant="caption" color="text.secondary" gutterBottom display="block">NR FDD (允许)</Typography>
                 <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0 }}>
-                  {NR_FDD_BANDS.map((band) => (
+                  {supportedBandOptions.nr_fdd_bands.length > 0 ? supportedBandOptions.nr_fdd_bands.map((band) => (
                     <FormControlLabel
                       key={`nr-fdd-${band}`}
                       control={
@@ -1257,7 +1260,7 @@ export default function NetworkPage() {
                       label={<Typography variant="caption">n{band}</Typography>}
                       sx={{ mr: 0.5, ml: 0 }}
                     />
-                  ))}
+                  )) : <Typography variant="caption" color="text.disabled">无</Typography>}
                 </Box>
               </Grid>
 
@@ -1265,7 +1268,7 @@ export default function NetworkPage() {
               <Grid size={{ xs: 6, sm: 3 }}>
                 <Typography variant="caption" color="text.secondary" gutterBottom display="block">NR TDD (允许)</Typography>
                 <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0 }}>
-                  {NR_TDD_BANDS.map((band) => (
+                  {supportedBandOptions.nr_tdd_bands.length > 0 ? supportedBandOptions.nr_tdd_bands.map((band) => (
                     <FormControlLabel
                       key={`nr-tdd-${band}`}
                       control={
@@ -1279,7 +1282,7 @@ export default function NetworkPage() {
                       label={<Typography variant="caption">n{band}</Typography>}
                       sx={{ mr: 0.5, ml: 0 }}
                     />
-                  ))}
+                  )) : <Typography variant="caption" color="text.disabled">无</Typography>}
                 </Box>
               </Grid>
             </Grid>
@@ -1289,7 +1292,7 @@ export default function NetworkPage() {
             {lockMode === 'unlocked' && (
               <Alert severity="success" sx={{ mb: 2 }}>
                 当前模式：<strong>未锁定</strong><br />
-                设备将使用所有支持的频段（B1, B3, B5, B8, B39, B41, N1, N3, N28, N41, N77, N78, N79）
+                设备将使用所有支持的频段（{formatBandSummary(bandLockStatus)}）
               </Alert>
             )}
 

@@ -311,12 +311,14 @@ jobs:
           body: |
             ## OTA 更新包
             
-            **版本**: ${{ steps.version.outputs.version }}
-            **Commit**: ${{ github.sha }}
-            **构建时间**: ${{ steps.package.outputs.build_time }}
-            **文件名**: `simadmin_${{ steps.version.outputs.version }}.tar.gz`
-            **latest 安装别名**: `simadmin_latest.tar.gz`
-            **MD5**: `${{ steps.package.outputs.ota_md5 }}`
+            ### 版本信息
+
+            - **版本**: ${{ steps.version.outputs.version }}
+            - **Commit**: ${{ github.sha }}
+            - **构建时间**: ${{ steps.package.outputs.build_time }}
+            - **文件名**: `simadmin_${{ steps.version.outputs.version }}.tar.gz`
+            - **latest 安装别名**: `simadmin_latest.tar.gz`
+            - **MD5**: `${{ steps.package.outputs.ota_md5 }}`
             
             ### 安装说明
             

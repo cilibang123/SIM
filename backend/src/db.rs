@@ -151,17 +151,6 @@ impl Database {
         Ok(count > 0)
     }
 
-    /// 更新短信状态
-    #[allow(dead_code)]
-    pub fn update_sms_status(&self, id: i64, status: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE sms_messages SET status = ?1 WHERE id = ?2",
-            params![status, id],
-        )?;
-        Ok(())
-    }
-
     /// 获取所有短信（分页）
     pub fn get_sms_messages(
         &self,
@@ -286,19 +275,6 @@ impl Database {
         })
     }
 
-    /// 删除旧短信（保留最近 N 条）
-    #[allow(dead_code)]
-    pub fn cleanup_old_sms(&self, keep_count: i64) -> Result<usize> {
-        let conn = self.conn.lock().unwrap();
-        let deleted = conn.execute(
-            "DELETE FROM sms_messages WHERE id NOT IN (
-                SELECT id FROM sms_messages ORDER BY timestamp DESC LIMIT ?1
-            )",
-            params![keep_count],
-        )?;
-        Ok(deleted)
-    }
-
     /// 删除所有短信
     pub fn clear_all_sms(&self) -> Result<()> {
         let conn = self.conn.lock().unwrap();
@@ -393,42 +369,6 @@ impl Database {
         )?;
 
         let records = stmt.query_map(params![limit, offset], |row| {
-            Ok(CallRecord {
-                id: row.get(0)?,
-                direction: row.get(1)?,
-                phone_number: row.get(2)?,
-                duration: row.get(3)?,
-                start_time: row.get(4)?,
-                end_time: row.get(5)?,
-                answered: row.get::<_, i32>(6)? != 0,
-            })
-        })?;
-
-        let mut result = Vec::new();
-        for record in records {
-            result.push(record?);
-        }
-
-        Ok(result)
-    }
-
-    /// 获取与特定号码的通话记录
-    #[allow(dead_code)]
-    pub fn get_call_history_by_number(
-        &self,
-        phone_number: &str,
-        limit: i64,
-    ) -> Result<Vec<CallRecord>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, direction, phone_number, duration, start_time, end_time, answered
-             FROM call_history
-             WHERE phone_number = ?1
-             ORDER BY start_time DESC
-             LIMIT ?2",
-        )?;
-
-        let records = stmt.query_map(params![phone_number, limit], |row| {
             Ok(CallRecord {
                 id: row.get(0)?,
                 direction: row.get(1)?,

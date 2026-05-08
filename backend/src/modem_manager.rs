@@ -149,6 +149,25 @@ fn parse_smsc_from_at_output(output: &str) -> String {
     String::new()
 }
 
+fn operator_code_from_imsi(imsi: &str) -> String {
+    let digits = imsi.trim();
+    if digits.len() < 5 || !digits.chars().all(|c| c.is_ascii_digit()) {
+        return String::new();
+    }
+
+    // Mainland China MCC 460 uses two-digit MNCs. Using six IMSI digits would
+    // mislabel China Mobile 46002 as MNC 027/026/etc.
+    if digits.starts_with("460") {
+        return digits[..5].to_string();
+    }
+
+    if digits.len() >= 6 {
+        digits[..6].to_string()
+    } else {
+        String::new()
+    }
+}
+
 fn extract_mode_pairs(value: &OwnedValue) -> Vec<(u32, u32)> {
     Vec::<(u32, u32)>::try_from(value.clone()).unwrap_or_default()
 }
@@ -635,11 +654,22 @@ pub async fn get_sim_info_data(conn: &Connection) -> zbus::Result<SimInfoRespons
 
     let sim_props = get_all_properties(conn, &sim_path, MM_SIM).await?;
     let msg_smsc = messaging_smsc_fallback(conn, &modem_path).await;
+    let iccid = sim_props
+        .get("SimIdentifier")
+        .map(extract_string)
+        .unwrap_or_default();
+    let imsi = sim_props
+        .get("Imsi")
+        .map(extract_string)
+        .unwrap_or_default();
 
     let mut operator_id = sim_props
         .get("OperatorIdentifier")
         .map(extract_string)
         .unwrap_or_default();
+    if operator_id.is_empty() {
+        operator_id = operator_code_from_imsi(&imsi);
+    }
     if operator_id.is_empty() {
         operator_id = gpp_props
             .get("OperatorCode")
@@ -673,14 +703,8 @@ pub async fn get_sim_info_data(conn: &Connection) -> zbus::Result<SimInfoRespons
 
     Ok(SimInfoResponse {
         present: true,
-        iccid: sim_props
-            .get("SimIdentifier")
-            .map(extract_string)
-            .unwrap_or_default(),
-        imsi: sim_props
-            .get("Imsi")
-            .map(extract_string)
-            .unwrap_or_default(),
+        iccid,
+        imsi,
         phone_numbers,
         sms_center,
         mcc,
@@ -1085,6 +1109,62 @@ LTE Timing Advance: 'unavailable'"#;
         assert_eq!(parsed.cells[2].earfcn, "100");
         assert_eq!(parsed.cells[2].pci, "76");
     }
+
+    #[test]
+    fn derives_china_operator_code_from_imsi_with_two_digit_mnc() {
+        assert_eq!(operator_code_from_imsi("460027004736506"), "46002");
+        assert_eq!(
+            split_operator_code(&operator_code_from_imsi("460027004736506")),
+            ("460".into(), "02".into())
+        );
+    }
+
+    #[test]
+    fn derives_non_china_operator_code_with_three_digit_mnc_fallback() {
+        assert_eq!(operator_code_from_imsi("310260123456789"), "310260");
+        assert_eq!(
+            split_operator_code(&operator_code_from_imsi("310260123456789")),
+            ("310".into(), "260".into())
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_imsi_for_operator_derivation() {
+        assert_eq!(operator_code_from_imsi(""), "");
+        assert_eq!(operator_code_from_imsi("4600"), "");
+        assert_eq!(operator_code_from_imsi("46002abc"), "");
+    }
+
+    #[test]
+    fn maps_supported_physical_band_selection_to_modemmanager_ids() {
+        let req = BandLockRequest {
+            lte_fdd_bands: vec![1, 3],
+            lte_tdd_bands: vec![],
+            nr_fdd_bands: vec![],
+            nr_tdd_bands: vec![],
+        };
+
+        let mapped = accumulate_mm_ids_from_physical_bands(&req, &[31, 33, 35, 38]).unwrap();
+
+        assert_eq!(mapped, vec![31, 33]);
+    }
+
+    #[test]
+    fn rejects_partially_unsupported_physical_band_selection() {
+        let req = BandLockRequest {
+            lte_fdd_bands: vec![1, 8],
+            lte_tdd_bands: vec![],
+            nr_fdd_bands: vec![],
+            nr_tdd_bands: vec![78],
+        };
+
+        let unsupported = accumulate_mm_ids_from_physical_bands(&req, &[31]).unwrap_err();
+
+        assert_eq!(
+            unsupported,
+            vec!["LTE B8".to_string(), "NR n78".to_string()]
+        );
+    }
 }
 
 fn parse_mmcli_colon_value(line: &str) -> Option<(String, String)> {
@@ -1396,7 +1476,7 @@ fn nr_physical_is_tdd(n: u32) -> bool {
     )
 }
 
-fn split_current_bands_to_legacy(
+fn split_mm_band_ids_to_physical(
     current_bands: &[u32],
 ) -> (Vec<u32>, Vec<u32>, Vec<u32>, Vec<u32>) {
     let mut lte_fdd = Vec::new();
@@ -1427,35 +1507,74 @@ fn split_current_bands_to_legacy(
     (lte_fdd, lte_tdd, nr_fdd, nr_tdd)
 }
 
-fn accumulate_mm_ids_from_legacy(req: &BandLockRequest, supported: &[u32]) -> Vec<u32> {
+fn push_supported_band(
+    out: &mut Vec<u32>,
+    unsupported: &mut Vec<String>,
+    supported: &[u32],
+    id: u32,
+    label: String,
+) {
+    if supported.contains(&id) {
+        out.push(id);
+    } else {
+        unsupported.push(label);
+    }
+}
+
+fn accumulate_mm_ids_from_physical_bands(
+    req: &BandLockRequest,
+    supported: &[u32],
+) -> Result<Vec<u32>, Vec<String>> {
     let mut out: Vec<u32> = Vec::new();
+    let mut unsupported: Vec<String> = Vec::new();
     for &p in &req.lte_fdd_bands {
         let id = 30 + p;
-        if supported.contains(&id) {
-            out.push(id);
-        }
+        push_supported_band(
+            &mut out,
+            &mut unsupported,
+            supported,
+            id,
+            format!("LTE B{p}"),
+        );
     }
     for &p in &req.lte_tdd_bands {
         let id = 30 + p;
-        if supported.contains(&id) {
-            out.push(id);
-        }
+        push_supported_band(
+            &mut out,
+            &mut unsupported,
+            supported,
+            id,
+            format!("LTE B{p}"),
+        );
     }
     for &n in &req.nr_fdd_bands {
         let id = 300 + n;
-        if supported.contains(&id) {
-            out.push(id);
-        }
+        push_supported_band(
+            &mut out,
+            &mut unsupported,
+            supported,
+            id,
+            format!("NR n{n}"),
+        );
     }
     for &n in &req.nr_tdd_bands {
         let id = 300 + n;
-        if supported.contains(&id) {
-            out.push(id);
-        }
+        push_supported_band(
+            &mut out,
+            &mut unsupported,
+            supported,
+            id,
+            format!("NR n{n}"),
+        );
+    }
+    if !unsupported.is_empty() {
+        unsupported.sort();
+        unsupported.dedup();
+        return Err(unsupported);
     }
     out.sort_unstable();
     out.dedup();
-    out
+    Ok(out)
 }
 
 pub async fn get_band_lock_status(conn: &Connection) -> zbus::Result<BandLockStatus> {
@@ -1470,9 +1589,19 @@ pub async fn get_band_lock_status(conn: &Connection) -> zbus::Result<BandLockSta
     current_sorted.sort_unstable();
     let locked = !supported_sorted.is_empty() && current_sorted != supported_sorted;
     let (lte_fdd_bands, lte_tdd_bands, nr_fdd_bands, nr_tdd_bands) =
-        split_current_bands_to_legacy(&current_bands);
+        split_mm_band_ids_to_physical(&current_bands);
+    let (
+        supported_lte_fdd_bands,
+        supported_lte_tdd_bands,
+        supported_nr_fdd_bands,
+        supported_nr_tdd_bands,
+    ) = split_mm_band_ids_to_physical(&supported_bands);
     Ok(BandLockStatus {
         locked,
+        supported_lte_fdd_bands,
+        supported_lte_tdd_bands,
+        supported_nr_fdd_bands,
+        supported_nr_tdd_bands,
         lte_fdd_bands,
         lte_tdd_bands,
         nr_fdd_bands,
@@ -1492,7 +1621,12 @@ pub async fn set_band_lock(conn: &Connection, req: &BandLockRequest) -> zbus::Re
         let next_bands = if all_empty {
             supported_bands.clone()
         } else {
-            accumulate_mm_ids_from_legacy(req, &supported_bands)
+            accumulate_mm_ids_from_physical_bands(req, &supported_bands).map_err(|unsupported| {
+                zbus::fdo::Error::Failed(format!(
+                    "Unsupported band selection: {}",
+                    unsupported.join(", ")
+                ))
+            })?
         };
         if !all_empty && next_bands.is_empty() {
             return Err(
@@ -2748,16 +2882,6 @@ async fn terminate_call(conn: &Connection, call_path: &str) -> zbus::Result<()> 
         Err(err) if is_incompatible_call_state_error(&err) => Ok(()),
         Err(err) => Err(err),
     }
-}
-
-#[allow(dead_code)]
-async fn hangup_call_direct(conn: &Connection, call_path: &str) -> zbus::Result<()> {
-    with_serial(async {
-        let call_proxy = Proxy::new(conn, MM_SERVICE, call_path, MM_CALL).await?;
-        call_proxy.call::<_, _, ()>("Hangup", &()).await?;
-        Ok(())
-    })
-    .await
 }
 
 pub async fn hangup_all_calls(conn: &Connection) -> zbus::Result<()> {

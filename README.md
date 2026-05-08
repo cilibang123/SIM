@@ -154,12 +154,18 @@ cargo run -- --host :: --port 3000
 ./scripts/build.sh --no-ota
 ```
 
+Windows 下建议在 WSL2 Ubuntu 中执行完整 OTA 构建。原生 PowerShell 不能直接运行 Bash 脚本；Git Bash 容易受 Node/npm/pnpm PATH 影响，完整 OTA 仍需要 `aarch64-unknown-linux-musl-gcc` 等 Linux 交叉编译工具链：
+
+```bash
+./scripts/build.sh --no-upx
+```
+
 构建脚本会：
 
 - 同步 `VERSION` 到 `backend/Cargo.toml` 和 `frontend/package.json`。
-- 构建前端到 `frontend/dist/`。
+- 使用 `pnpm-lock.yaml` 时通过 `pnpm install --frozen-lockfile`、`pnpm run lint` 和 `pnpm exec vite build` 构建前端到 `frontend/dist/`。
 - 交叉编译后端到 `backend/target/aarch64-unknown-linux-musl/release/simadmin`。
-- 可选使用 UPX 压缩后端二进制。
+- 可选使用 UPX 压缩后端二进制；未安装 UPX 时会自动跳过压缩。
 - 生成 `release/simadmin_<version>.tar.gz` OTA 包。
 
 ### 通过 ADB 部署
@@ -317,6 +323,34 @@ journalctl -u simadmin -f
 - OTA 上传、在线下载、校验、替换二进制和前端资源。
 
 ## 🚀 版本更新记录
+
+### 📌 v1.0.2
+
+#### ✨ 新增功能
+
+- 频段锁定状态新增后端报告的真实支持频段：
+  - `supported_lte_fdd_bands`
+  - `supported_lte_tdd_bands`
+  - `supported_nr_fdd_bands`
+  - `supported_nr_tdd_bands`
+- 小区与信号数据增加 `qmicli` 兜底解析，提升 ModemManager `GetCellInfo` 不可用场景下的可观测性。
+
+#### 💫 体验优化
+
+- 优化移动网络注册问题的诊断路径，重点区分 SIM 归属运营商、当前注册网络、漫游状态、射频模式、频段限制和小区数据。
+- 前端自定义频段选项改为基于后端 `SupportedBands` 动态显示，不再依赖固定写死的 LTE/NR 频段列表。
+- 从“未锁定”切换到“自定义”时，默认勾选当前设备真实支持的全部频段，更符合使用预期。
+- 移除网络页面中不必要的“验证说明”文案，简化频段锁定 UI。
+
+#### 🐞 bug 修复
+
+- SIM 信息优先从 IMSI 推导 MCC/MNC，避免注册到漫游网络时把当前网络运营商误当成 SIM 归属运营商。
+- 后端设置自定义频段时会校验用户选择是否被当前 modem 支持；发现不支持的频段会返回明确错误，不再静默忽略。
+- 自动注册遇到 QMI Internal 类错误时增强恢复处理，降低调制解调器处于异常注册状态时的卡死概率。
+
+#### 📚 接口与文档更新
+
+- 修正 README、Bruno API 示例和前端开发代理中的默认访问地址为 `http://192.168.68.1:3000/`。
 
 ### 📌 v1.0.1
 
@@ -628,7 +662,7 @@ www/
 
 ```json
 {
-  "version": "1.0.1",
+  "version": "1.0.2",
   "commit": "abcdef0",
   "build_time": "2026-05-06T00:00:00Z",
   "binary_md5": "md5-of-binary",

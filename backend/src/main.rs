@@ -40,7 +40,6 @@ mod webhook;
 
 use config::{get_default_config_path, ConfigManager};
 use db::Database;
-#[allow(unused_imports)]
 use handlers::*;
 use modem_manager::{ensure_networkmanager_wwan_unmanaged, init_data_connection};
 use state::AppState;

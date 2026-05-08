@@ -193,6 +193,14 @@ pub struct RadioModeRequest {
 pub struct BandLockStatus {
     pub locked: bool,
     #[serde(default)]
+    pub supported_lte_fdd_bands: Vec<u32>,
+    #[serde(default)]
+    pub supported_lte_tdd_bands: Vec<u32>,
+    #[serde(default)]
+    pub supported_nr_fdd_bands: Vec<u32>,
+    #[serde(default)]
+    pub supported_nr_tdd_bands: Vec<u32>,
+    #[serde(default)]
     pub lte_fdd_bands: Vec<u32>,
     #[serde(default)]
     pub lte_tdd_bands: Vec<u32>,

@@ -1,4 +1,4 @@
-//! API 处理器模块 (MSM8916 ModemManager 版)
+//! API 处理器模块 (ModemManager 版)
 //!
 //! 包含所有 HTTP API 的处理函数
 
@@ -52,7 +52,7 @@ pub async fn health_check() -> impl IntoResponse {
         Json(json!({
             "status": "ok",
             "message": "Service is running",
-            "platform": "msm8916",
+            "platform": "linux-modem",
             "version": env!("CARGO_PKG_VERSION"),
         })),
     )

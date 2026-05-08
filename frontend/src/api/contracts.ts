@@ -216,6 +216,10 @@ export interface RadioModeResponse {
 
 export interface BandLockStatus {
   locked: boolean
+  supported_lte_fdd_bands: number[]
+  supported_lte_tdd_bands: number[]
+  supported_nr_fdd_bands: number[]
+  supported_nr_tdd_bands: number[]
   lte_fdd_bands: number[]
   lte_tdd_bands: number[]
   nr_fdd_bands: number[]

@@ -462,12 +462,6 @@ impl ConfigManager {
         manager
     }
 
-    /// 获取当前配置
-    #[allow(dead_code)]
-    pub fn get(&self) -> AppConfig {
-        self.config.read().unwrap().clone()
-    }
-
     /// 获取通知配置
     pub fn get_notifications(&self) -> NotificationConfig {
         self.config.read().unwrap().notifications.clone()
@@ -507,16 +501,6 @@ impl ConfigManager {
         self.save()
     }
 
-    /// 更新整个配置
-    #[allow(dead_code)]
-    pub fn set(&self, config: AppConfig) -> Result<(), String> {
-        {
-            let mut current = self.config.write().unwrap();
-            *current = config;
-        }
-        self.save()
-    }
-
     /// 保存配置到文件
     pub fn save(&self) -> Result<(), String> {
         let config = self.config.read().unwrap();
@@ -531,27 +515,6 @@ impl ConfigManager {
 
         fs::write(&self.config_path, content)
             .map_err(|e| format!("Failed to write config file: {}", e))?;
-
-        Ok(())
-    }
-
-    /// 重新加载配置
-    #[allow(dead_code)]
-    pub fn reload(&self) -> Result<(), String> {
-        if !self.config_path.exists() {
-            return Err("Config file does not exist".to_string());
-        }
-
-        let content = fs::read_to_string(&self.config_path)
-            .map_err(|e| format!("Failed to read config file: {}", e))?;
-
-        let new_config: AppConfig = serde_json::from_str(&content)
-            .map_err(|e| format!("Failed to parse config file: {}", e))?;
-
-        {
-            let mut config = self.config.write().unwrap();
-            *config = new_config;
-        }
 
         Ok(())
     }
