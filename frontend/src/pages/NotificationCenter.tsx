@@ -93,6 +93,7 @@ const LEGACY_MOJIBAKE_CALL_TEMPLATE = '{\n'
 
 const SMS_TEMPLATE_VARIABLES = [
   { label: '发送方号码', displayToken: '{{发送方号码}}', backendToken: '{{phone_number}}' },
+  { label: '本机号码', displayToken: '{{本机号码}}', backendToken: '{{own_number}}' },
   { label: '短信内容', displayToken: '{{短信内容}}', backendToken: '{{content}}' },
   { label: '时间', displayToken: '{{时间}}', backendToken: '{{timestamp}}' },
   { label: '短信方向', displayToken: '{{短信方向}}', backendToken: '{{direction}}' },

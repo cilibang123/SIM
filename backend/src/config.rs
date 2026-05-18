@@ -296,7 +296,7 @@ fn default_sms_template() -> String {
     r#"{
   "msg_type": "text",
   "content": {
-    "text": "📱 短信通知\n发送方: {{phone_number}}\n内容: {{content}}\n时间: {{timestamp}}"
+    "text": "📱 短信通知\n发送方: {{phone_number}}\n内容: {{content}}\n时间: {{timestamp}}\n本机号码: {{own_number}}"
   }
 }"#
     .to_string()
@@ -333,7 +333,7 @@ fn default_update_template() -> String {
 }
 
 fn default_plain_sms_template() -> String {
-    "📱 短信通知\n发送方: {{phone_number}}\n内容: {{content}}\n时间: {{timestamp}}".to_string()
+    "📱 短信通知\n发送方: {{phone_number}}\n内容: {{content}}\n时间: {{timestamp}}\n本机号码: {{own_number}}".to_string()
 }
 
 fn default_plain_call_template() -> String {

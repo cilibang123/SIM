@@ -537,7 +537,7 @@ export interface NotificationConfig {
 export const DEFAULT_SMS_TEMPLATE = `{
   "msg_type": "text",
   "content": {
-    "text": "📱 短信通知\\n发送方: {{phone_number}}\\n内容: {{content}}\\n时间: {{timestamp}}"
+    "text": "📱 短信通知\\n发送方: {{phone_number}}\\n内容: {{content}}\\n时间: {{timestamp}}\\n本机号码: {{own_number}}"
   }
 }`
 
@@ -565,7 +565,8 @@ export const DEFAULT_UPDATE_TEMPLATE = `{
 export const DEFAULT_PLAIN_SMS_TEMPLATE = `📱 短信通知
 发送方: {{phone_number}}
 内容: {{content}}
-时间: {{timestamp}}`
+时间: {{timestamp}}
+本机号码: {{own_number}}`
 
 export const DEFAULT_PLAIN_CALL_TEMPLATE = `📞 来电通知
 号码: {{phone_number}}

@@ -64,7 +64,7 @@ const MM_MODEM_STATE_CONNECTED: i32 = 11;
 const MM_MODEM_PORT_TYPE_AT: u32 = 3;
 const MM_MODEM_PORT_TYPE_QMI: u32 = 6;
 const MM_MODEM_PORT_TYPE_MBIM: u32 = 7;
-const SMSC_COMMAND_TIMEOUT_SECS: u64 = 3;
+const MODEM_HELPER_COMMAND_TIMEOUT_SECS: u64 = 3;
 
 type InterfaceProperties = HashMap<String, OwnedValue>;
 type ManagedObjects = HashMap<OwnedObjectPath, HashMap<String, InterfaceProperties>>;
@@ -255,6 +255,178 @@ fn extract_smsc_property(props: &HashMap<String, OwnedValue>) -> String {
     String::new()
 }
 
+fn is_plausible_phone_number(value: &str) -> bool {
+    let value = value.trim();
+    let digits = value.strip_prefix('+').unwrap_or(value);
+    (4..=20).contains(&digits.len())
+        && digits.chars().all(|c| c.is_ascii_digit())
+        && digits.chars().any(|c| c != '0')
+}
+
+fn normalize_phone_number(value: &str) -> String {
+    let value = value
+        .trim()
+        .trim_matches(|c| matches!(c, '"' | '\'' | ',' | ';'))
+        .trim()
+        .strip_prefix("tel:")
+        .unwrap_or_else(|| value.trim());
+
+    let mut normalized = String::new();
+    for ch in value.chars() {
+        if ch == '+' && normalized.is_empty() {
+            normalized.push(ch);
+        } else if ch.is_ascii_digit() {
+            normalized.push(ch);
+        }
+    }
+
+    if is_plausible_phone_number(&normalized) {
+        normalized
+    } else {
+        String::new()
+    }
+}
+
+fn push_phone_number_candidate(candidates: &mut Vec<String>, candidate: &str) {
+    let normalized = normalize_phone_number(candidate);
+    if !normalized.is_empty() && !candidates.contains(&normalized) {
+        candidates.push(normalized);
+    }
+}
+
+fn normalize_phone_numbers(values: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut phone_numbers = Vec::new();
+    for value in values {
+        push_phone_number_candidate(&mut phone_numbers, &value);
+    }
+    phone_numbers
+}
+
+fn extract_quoted_values(text: &str) -> Vec<String> {
+    let mut values = Vec::new();
+    for quote in ['"', '\''] {
+        let mut rest = text;
+        while let Some(start) = rest.find(quote) {
+            rest = &rest[start + quote.len_utf8()..];
+            let Some(end) = rest.find(quote) else {
+                break;
+            };
+            values.push(rest[..end].to_string());
+            rest = &rest[end + quote.len_utf8()..];
+        }
+    }
+    values
+}
+
+fn split_at_response_fields(data: &str) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+
+    for ch in data.chars() {
+        if ch == '"' {
+            in_quotes = !in_quotes;
+            current.push(ch);
+        } else if ch == ',' && !in_quotes {
+            fields.push(current.trim().to_string());
+            current.clear();
+        } else {
+            current.push(ch);
+        }
+    }
+    fields.push(current.trim().to_string());
+    fields
+}
+
+fn parse_own_numbers_from_at_output(output: &str) -> Vec<String> {
+    let mut phone_numbers = Vec::new();
+    for line in output.lines() {
+        let Some(start) = line.find("+CNUM:") else {
+            continue;
+        };
+        let data = &line[start + "+CNUM:".len()..];
+        let fields = split_at_response_fields(data);
+        if let Some(number) = fields.get(1) {
+            push_phone_number_candidate(&mut phone_numbers, number);
+        }
+    }
+    phone_numbers
+}
+
+fn collect_phone_number_candidates_from_line(candidates: &mut Vec<String>, line: &str) {
+    for value in extract_quoted_values(line) {
+        push_phone_number_candidate(candidates, &value);
+    }
+
+    if let Some((_, value)) = line.split_once(':') {
+        for token in value.split(|c: char| c.is_whitespace() || matches!(c, ',' | ';')) {
+            push_phone_number_candidate(candidates, token);
+        }
+    }
+}
+
+fn parse_own_numbers_from_labeled_text(output: &str) -> Vec<String> {
+    let mut phone_numbers = Vec::new();
+    let mut phone_section = false;
+
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            phone_section = false;
+            continue;
+        }
+
+        let lower = trimmed.to_ascii_lowercase();
+        let is_phone_label = lower.contains("msisdn")
+            || lower.contains("own number")
+            || lower.contains("phone number")
+            || lower.contains("telephone number");
+
+        if is_phone_label {
+            collect_phone_number_candidates_from_line(&mut phone_numbers, trimmed);
+            phone_section = lower.contains("numbers");
+            continue;
+        }
+
+        if phone_section && (trimmed.starts_with('[') || trimmed.starts_with('-')) {
+            collect_phone_number_candidates_from_line(&mut phone_numbers, trimmed);
+            continue;
+        }
+
+        phone_section = false;
+    }
+
+    phone_numbers
+}
+
+fn extract_own_numbers_property(props: &HashMap<String, OwnedValue>) -> Vec<String> {
+    let mut phone_numbers = Vec::new();
+    for key in [
+        "OwnNumbers",
+        "OwnNumber",
+        "PhoneNumbers",
+        "PhoneNumber",
+        "MSISDN",
+        "Msisdn",
+        "SubscriberNumber",
+        "own-numbers",
+        "own-number",
+        "phone-numbers",
+        "phone-number",
+        "msisdn",
+        "subscriber-number",
+        "telephone-numbers",
+        "telephone-number",
+    ] {
+        if let Some(value) = props.get(key) {
+            for number in extract_string_list(value) {
+                push_phone_number_candidate(&mut phone_numbers, &number);
+            }
+        }
+    }
+    phone_numbers
+}
+
 fn operator_code_from_imsi(imsi: &str) -> String {
     let digits = imsi.trim();
     if digits.len() < 5 || !digits.chars().all(|c| c.is_ascii_digit()) {
@@ -281,7 +453,7 @@ pub struct SimIdentity {
     pub operator_id: String,
 }
 
-fn smsc_identity_keys(identity: &SimIdentity) -> Vec<String> {
+fn sim_identity_keys(identity: &SimIdentity) -> Vec<String> {
     let mut keys = Vec::new();
     if !identity.iccid.is_empty() {
         keys.push(format!("iccid:{}", identity.iccid));
@@ -293,6 +465,18 @@ fn smsc_identity_keys(identity: &SimIdentity) -> Vec<String> {
         keys.push(format!("operator:{}", identity.operator_id));
     }
     keys
+}
+
+fn smsc_identity_keys(identity: &SimIdentity) -> Vec<String> {
+    sim_identity_keys(identity)
+}
+
+fn own_number_identity_key(identity: &SimIdentity) -> Option<String> {
+    if identity.iccid.is_empty() {
+        None
+    } else {
+        Some(format!("iccid:{}", identity.iccid))
+    }
 }
 
 pub fn cache_smsc_for_identity(
@@ -327,6 +511,40 @@ fn cached_smsc_for_identity(db: &Database, identity: &SimIdentity) -> String {
         .ok()
         .flatten()
         .map(|entry| normalize_smsc(&entry.sms_center))
+        .unwrap_or_default()
+}
+
+fn cache_own_numbers_for_identity(
+    db: &Database,
+    identity: &SimIdentity,
+    phone_numbers: &[String],
+    source: &str,
+) {
+    let phone_numbers = normalize_phone_numbers(phone_numbers.iter().cloned());
+    if phone_numbers.is_empty() {
+        return;
+    }
+    let Some(identity_key) = own_number_identity_key(identity) else {
+        return;
+    };
+    let _ = db.upsert_own_number_cache(
+        &identity_key,
+        &identity.iccid,
+        &identity.imsi,
+        &identity.operator_id,
+        &phone_numbers,
+        source,
+    );
+}
+
+fn cached_own_numbers_for_identity(db: &Database, identity: &SimIdentity) -> Vec<String> {
+    let Some(identity_key) = own_number_identity_key(identity) else {
+        return Vec::new();
+    };
+    db.get_own_number_cache(&[identity_key])
+        .ok()
+        .flatten()
+        .map(|entry| normalize_phone_numbers(entry.phone_numbers))
         .unwrap_or_default()
 }
 
@@ -846,9 +1064,9 @@ async fn existing_sms_smsc_fallback(conn: &Connection, modem_path: &str) -> Stri
     String::new()
 }
 
-async fn run_smsc_command(program: &str, args: Vec<String>) -> Result<String, String> {
+async fn run_modem_helper_command(program: &str, args: Vec<String>) -> Result<String, String> {
     let output = tokio::time::timeout(
-        Duration::from_secs(SMSC_COMMAND_TIMEOUT_SECS),
+        Duration::from_secs(MODEM_HELPER_COMMAND_TIMEOUT_SECS),
         Command::new(program).args(args).output(),
     )
     .await
@@ -866,6 +1084,126 @@ async fn run_smsc_command(program: &str, args: Vec<String>) -> Result<String, St
     }
 }
 
+async fn simple_status_own_numbers_fallback(conn: &Connection, modem_path: &str) -> Vec<String> {
+    let Ok(proxy) = Proxy::new(conn, MM_SERVICE, modem_path, MM_MODEM_SIMPLE).await else {
+        return Vec::new();
+    };
+    let Ok(status) = proxy
+        .call::<_, _, HashMap<String, OwnedValue>>("GetStatus", &())
+        .await
+    else {
+        return Vec::new();
+    };
+    extract_own_numbers_property(&status)
+}
+
+async fn mbim_subscriber_own_numbers_fallback(conn: &Connection, modem_path: &str) -> Vec<String> {
+    let Some(device) = mbim_control_device(conn, modem_path).await else {
+        return Vec::new();
+    };
+    let args = vec![
+        "-d".to_string(),
+        device,
+        "-p".to_string(),
+        "--query-subscriber-ready-status".to_string(),
+    ];
+    let Ok(output) = with_serial(async { run_modem_helper_command("mbimcli", args).await }).await
+    else {
+        return Vec::new();
+    };
+    parse_own_numbers_from_labeled_text(&output)
+}
+
+async fn qmi_dms_own_numbers_fallback(conn: &Connection, modem_path: &str) -> Vec<String> {
+    let Some(device) = qmi_control_device(conn, modem_path).await else {
+        return Vec::new();
+    };
+    let args = vec![
+        "-p".to_string(),
+        "-d".to_string(),
+        device,
+        "--dms-get-msisdn".to_string(),
+    ];
+    let Ok(output) = with_serial(async { run_modem_helper_command("qmicli", args).await }).await
+    else {
+        return Vec::new();
+    };
+    parse_own_numbers_from_labeled_text(&output)
+}
+
+async fn qmi_atr_own_numbers_fallback(conn: &Connection, modem_path: &str) -> Vec<String> {
+    let Some(device) = qmi_control_device(conn, modem_path).await else {
+        return Vec::new();
+    };
+    let args = vec![
+        "-p".to_string(),
+        "-d".to_string(),
+        device,
+        "--atr-send=AT+CNUM".to_string(),
+    ];
+    let Ok(output) = with_serial(async { run_modem_helper_command("qmicli", args).await }).await
+    else {
+        return Vec::new();
+    };
+    parse_own_numbers_from_at_output(&output)
+}
+
+async fn mbim_at_tunnel_own_numbers_fallback(conn: &Connection, modem_path: &str) -> Vec<String> {
+    let Some(device) = mbim_control_device(conn, modem_path).await else {
+        return Vec::new();
+    };
+    for option in [
+        "--fibocom-set-at-command=AT+CNUM",
+        "--compal-query-at-command=AT+CNUM",
+        "--intel-at-tunnel-set-at-command=AT+CNUM",
+    ] {
+        let args = vec![
+            "-d".to_string(),
+            device.clone(),
+            "-p".to_string(),
+            option.to_string(),
+        ];
+        let Ok(output) =
+            with_serial(async { run_modem_helper_command("mbimcli", args).await }).await
+        else {
+            continue;
+        };
+        let phone_numbers = parse_own_numbers_from_at_output(&output);
+        if !phone_numbers.is_empty() {
+            return phone_numbers;
+        }
+    }
+    Vec::new()
+}
+
+async fn direct_at_own_numbers_fallback(conn: &Connection) -> Vec<String> {
+    let Ok(output) = with_serial(async { run_direct_at_command(conn, "AT+CNUM").await }).await
+    else {
+        return Vec::new();
+    };
+    parse_own_numbers_from_at_output(&output)
+}
+
+async fn active_protocol_own_numbers_fallback(conn: &Connection, modem_path: &str) -> Vec<String> {
+    let phone_numbers = mbim_subscriber_own_numbers_fallback(conn, modem_path).await;
+    if !phone_numbers.is_empty() {
+        return phone_numbers;
+    }
+    let phone_numbers = qmi_dms_own_numbers_fallback(conn, modem_path).await;
+    if !phone_numbers.is_empty() {
+        return phone_numbers;
+    }
+    let phone_numbers = qmi_atr_own_numbers_fallback(conn, modem_path).await;
+    if !phone_numbers.is_empty() {
+        return phone_numbers;
+    }
+    let phone_numbers = mbim_at_tunnel_own_numbers_fallback(conn, modem_path).await;
+    if !phone_numbers.is_empty() {
+        return phone_numbers;
+    }
+    direct_at_own_numbers_fallback(conn).await
+}
+
 async fn mbim_sms_config_smsc_fallback(conn: &Connection, modem_path: &str) -> String {
     let Some(device) = mbim_control_device(conn, modem_path).await else {
         return String::new();
@@ -876,7 +1214,8 @@ async fn mbim_sms_config_smsc_fallback(conn: &Connection, modem_path: &str) -> S
         "-p".to_string(),
         "--sms-query-configuration".to_string(),
     ];
-    let Ok(output) = with_serial(async { run_smsc_command("mbimcli", args).await }).await else {
+    let Ok(output) = with_serial(async { run_modem_helper_command("mbimcli", args).await }).await
+    else {
         return String::new();
     };
     extract_smsc_from_text(&output)
@@ -892,7 +1231,8 @@ async fn qmi_wms_smsc_fallback(conn: &Connection, modem_path: &str) -> String {
         device,
         "--wms-get-smsc-address".to_string(),
     ];
-    let Ok(output) = with_serial(async { run_smsc_command("qmicli", args).await }).await else {
+    let Ok(output) = with_serial(async { run_modem_helper_command("qmicli", args).await }).await
+    else {
         return String::new();
     };
     extract_smsc_from_text(&output)
@@ -908,7 +1248,8 @@ async fn qmi_atr_smsc_fallback(conn: &Connection, modem_path: &str) -> String {
         device,
         "--atr-send=AT+CSCA?".to_string(),
     ];
-    let Ok(output) = with_serial(async { run_smsc_command("qmicli", args).await }).await else {
+    let Ok(output) = with_serial(async { run_modem_helper_command("qmicli", args).await }).await
+    else {
         return String::new();
     };
     parse_smsc_from_at_output(&output)
@@ -929,7 +1270,8 @@ async fn mbim_at_tunnel_smsc_fallback(conn: &Connection, modem_path: &str) -> St
             "-p".to_string(),
             option.to_string(),
         ];
-        let Ok(output) = with_serial(async { run_smsc_command("mbimcli", args).await }).await
+        let Ok(output) =
+            with_serial(async { run_modem_helper_command("mbimcli", args).await }).await
         else {
             continue;
         };
@@ -1016,13 +1358,37 @@ pub async fn get_sim_info_data_with_cache(
     };
     let (mcc, mnc) = split_operator_code(&operator_id);
 
-    let mut phone_numbers: Vec<String> = Vec::new();
-    if let Some(v) = sim_props.get("OwnNumbers") {
-        phone_numbers.extend(extract_string_list(v));
+    let mut phone_numbers = extract_own_numbers_property(&sim_props);
+    if phone_numbers.is_empty() {
+        phone_numbers = extract_own_numbers_property(&modem_props);
     }
     if phone_numbers.is_empty() {
-        if let Some(v) = modem_props.get("OwnNumbers") {
-            phone_numbers.extend(extract_string_list(v));
+        phone_numbers = extract_own_numbers_property(&gpp_props);
+    }
+    if !phone_numbers.is_empty() {
+        if let Some(db) = db {
+            cache_own_numbers_for_identity(db, &identity, &phone_numbers, "dbus");
+        }
+    }
+    if phone_numbers.is_empty() {
+        phone_numbers = simple_status_own_numbers_fallback(conn, &modem_path).await;
+        if !phone_numbers.is_empty() {
+            if let Some(db) = db {
+                cache_own_numbers_for_identity(db, &identity, &phone_numbers, "dbus_status");
+            }
+        }
+    }
+    if phone_numbers.is_empty() {
+        if let Some(db) = db {
+            phone_numbers = cached_own_numbers_for_identity(db, &identity);
+        }
+    }
+    if phone_numbers.is_empty() {
+        phone_numbers = active_protocol_own_numbers_fallback(conn, &modem_path).await;
+        if !phone_numbers.is_empty() {
+            if let Some(db) = db {
+                cache_own_numbers_for_identity(db, &identity, &phone_numbers, "protocol");
+            }
         }
     }
     phone_numbers.sort();
@@ -1541,6 +1907,76 @@ LTE Timing Advance: 'unavailable'"#;
         let output = "SMSC Address\n  Type: 'international'\n  Number: '+34644109030'";
 
         assert_eq!(extract_smsc_from_text(output), "+34644109030");
+    }
+
+    #[test]
+    fn parses_own_numbers_from_at_cnum_output() {
+        let output = "AT+CNUM\r\r\n+CNUM: \"Voice\",\"+8613912345678\",145\r\n+CNUM: \"Data\",\"13987654321\",129\r\n\r\nOK\r\n";
+
+        assert_eq!(
+            parse_own_numbers_from_at_output(output),
+            vec!["+8613912345678".to_string(), "13987654321".to_string()]
+        );
+    }
+
+    #[test]
+    fn parses_own_numbers_from_wrapped_at_cnum_output() {
+        let output = "response: '+CNUM: \"\",\"+447700900123\",145'";
+
+        assert_eq!(
+            parse_own_numbers_from_at_output(output),
+            vec!["+447700900123".to_string()]
+        );
+    }
+
+    #[test]
+    fn parses_own_numbers_from_qmi_msisdn_output() {
+        let output = "[/dev/cdc-wdm0] Successfully got MSISDN:\n\tMSISDN: '+15551234567'";
+
+        assert_eq!(
+            parse_own_numbers_from_labeled_text(output),
+            vec!["+15551234567".to_string()]
+        );
+    }
+
+    #[test]
+    fn parses_own_numbers_from_mbim_subscriber_output() {
+        let output = "Subscriber ready status retrieved:\n  Ready state: 'initialized'\n  Subscriber ID: '310260123456789'\n  Telephone numbers: (1)\n    [0]: '+15557654321'";
+
+        assert_eq!(
+            parse_own_numbers_from_labeled_text(output),
+            vec!["+15557654321".to_string()]
+        );
+    }
+
+    #[test]
+    fn normalizes_and_rejects_invalid_own_numbers() {
+        assert_eq!(
+            normalize_phone_number(" tel:+1 (555) 123-4567 "),
+            "+15551234567"
+        );
+        assert_eq!(normalize_phone_number("145"), "");
+        assert_eq!(normalize_phone_number("000000"), "");
+    }
+
+    #[test]
+    fn binds_own_number_cache_to_iccid_only() {
+        let identity = SimIdentity {
+            iccid: "89860012345678901234".to_string(),
+            imsi: "460001234567890".to_string(),
+            operator_id: "46000".to_string(),
+        };
+        assert_eq!(
+            own_number_identity_key(&identity),
+            Some("iccid:89860012345678901234".to_string())
+        );
+
+        let identity_without_iccid = SimIdentity {
+            iccid: String::new(),
+            imsi: "460001234567890".to_string(),
+            operator_id: "46000".to_string(),
+        };
+        assert_eq!(own_number_identity_key(&identity_without_iccid), None);
     }
 
     #[test]

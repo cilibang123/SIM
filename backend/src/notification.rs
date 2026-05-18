@@ -3,8 +3,9 @@ use crate::config::{
     MessageChannelConfig, NotificationChannel, NotificationConfig, PushPlusConfig, TelegramConfig,
     WebhookConfig, WecomAppConfig, WecomRobotConfig,
 };
-use crate::db::{CallRecord, SmsMessage};
+use crate::db::{CallRecord, Database, SmsMessage};
 use crate::models::{DdnsEvent, VersionUpdateEvent};
+use crate::modem_manager::get_sim_info_data_with_cache;
 use base64::{engine::general_purpose, Engine as _};
 use chrono::{DateTime, FixedOffset, NaiveDateTime, Utc};
 use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
@@ -15,6 +16,7 @@ use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use zbus::Connection;
 
 const BEIJING_UTC_OFFSET_SECONDS: i32 = 8 * 60 * 60;
 const NOTIFICATION_TIME_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
@@ -23,6 +25,8 @@ const NOTIFICATION_TIME_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
 pub struct NotificationSender {
     client: Client,
     config_manager: Arc<ConfigManager>,
+    dbus_conn: Arc<Connection>,
+    database: Arc<Database>,
     wecom_token_cache: tokio::sync::Mutex<HashMap<(String, String), WecomTokenCacheEntry>>,
 }
 
@@ -46,15 +50,26 @@ pub struct NotificationFanoutResult {
     pub errors: Vec<String>,
 }
 
+#[derive(Default)]
+struct SmsTemplateContext {
+    own_number: String,
+}
+
 impl NotificationSender {
     /// Create a new sender.
-    pub fn new(config_manager: Arc<ConfigManager>) -> Self {
+    pub fn new(
+        config_manager: Arc<ConfigManager>,
+        dbus_conn: Arc<Connection>,
+        database: Arc<Database>,
+    ) -> Self {
         Self {
             client: Client::builder()
                 .timeout(std::time::Duration::from_secs(10))
                 .build()
                 .expect("Failed to create HTTP client"),
             config_manager,
+            dbus_conn,
+            database,
             wecom_token_cache: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
@@ -63,14 +78,26 @@ impl NotificationSender {
         self.config_manager.get_notifications()
     }
 
+    async fn sms_template_context(&self) -> SmsTemplateContext {
+        let own_number =
+            get_sim_info_data_with_cache(self.dbus_conn.as_ref(), Some(self.database.as_ref()))
+                .await
+                .ok()
+                .map(|sim| sim.phone_numbers.join(", "))
+                .unwrap_or_default();
+
+        SmsTemplateContext { own_number }
+    }
+
     /// Forward an incoming SMS to all enabled channels.
     pub async fn forward_sms(&self, message: &SmsMessage) -> Result<(), String> {
         let config = self.get_config();
+        let context = self.sms_template_context().await;
         let mut errors = Vec::new();
 
         for channel in all_channels() {
             if let Err(err) = self
-                .send_sms_to_channel(channel, &config, message, false)
+                .send_sms_to_channel(channel, &config, message, &context, false)
                 .await
             {
                 errors.push(format!("{}: {}", channel.label(), err));
@@ -174,7 +201,8 @@ impl NotificationSender {
             pdu: None,
         };
 
-        self.send_sms_to_channel(channel, &config, &test_message, true)
+        let context = self.sms_template_context().await;
+        self.send_sms_to_channel(channel, &config, &test_message, &context, true)
             .await
     }
 
@@ -183,39 +211,44 @@ impl NotificationSender {
         channel: NotificationChannel,
         config: &NotificationConfig,
         message: &SmsMessage,
+        context: &SmsTemplateContext,
         force: bool,
     ) -> Result<String, String> {
         match channel {
             NotificationChannel::Webhook => {
-                self.send_webhook_sms(&config.webhook, message, force).await
+                self.send_webhook_sms(&config.webhook, message, context, force)
+                    .await
             }
-            NotificationChannel::Bark => self.send_bark_sms(&config.bark, message, force).await,
+            NotificationChannel::Bark => {
+                self.send_bark_sms(&config.bark, message, context, force)
+                    .await
+            }
             NotificationChannel::PushPlus => {
-                self.send_pushplus_sms(&config.pushplus, message, force)
+                self.send_pushplus_sms(&config.pushplus, message, context, force)
                     .await
             }
             NotificationChannel::WecomApp => {
-                self.send_wecom_app_sms(&config.wecom_app, message, force)
+                self.send_wecom_app_sms(&config.wecom_app, message, context, force)
                     .await
             }
             NotificationChannel::WecomRobot => {
-                self.send_wecom_robot_sms(&config.wecom_robot, message, force)
+                self.send_wecom_robot_sms(&config.wecom_robot, message, context, force)
                     .await
             }
             NotificationChannel::DingtalkRobot => {
-                self.send_dingtalk_robot_sms(&config.dingtalk_robot, message, force)
+                self.send_dingtalk_robot_sms(&config.dingtalk_robot, message, context, force)
                     .await
             }
             NotificationChannel::DingtalkApp => {
-                self.send_dingtalk_app_sms(&config.dingtalk_app, message, force)
+                self.send_dingtalk_app_sms(&config.dingtalk_app, message, context, force)
                     .await
             }
             NotificationChannel::FeishuRobot => {
-                self.send_feishu_robot_sms(&config.feishu_robot, message, force)
+                self.send_feishu_robot_sms(&config.feishu_robot, message, context, force)
                     .await
             }
             NotificationChannel::Telegram => {
-                self.send_telegram_sms(&config.telegram, message, force)
+                self.send_telegram_sms(&config.telegram, message, context, force)
                     .await
             }
         }
@@ -341,6 +374,7 @@ impl NotificationSender {
         &self,
         config: &WebhookConfig,
         message: &SmsMessage,
+        context: &SmsTemplateContext,
         force: bool,
     ) -> Result<String, String> {
         if !force && (!config.enabled || !config.forward_sms) {
@@ -350,7 +384,7 @@ impl NotificationSender {
             return Err("Webhook URL is not configured".to_string());
         }
 
-        let payload = render_sms_template(&config.sms_template, message, true);
+        let payload = render_sms_template(&config.sms_template, message, context, true);
         self.send_webhook_raw(config, &payload).await
     }
 
@@ -443,6 +477,7 @@ impl NotificationSender {
         &self,
         config: &BarkConfig,
         message: &SmsMessage,
+        context: &SmsTemplateContext,
         force: bool,
     ) -> Result<String, String> {
         if !should_send_sms(&config.common, force) {
@@ -452,8 +487,8 @@ impl NotificationSender {
             return Err("Bark device key is not configured".to_string());
         }
 
-        let title = render_sms_template(&config.title_template, message, false);
-        let body = render_sms_template(&config.common.sms_template, message, false);
+        let title = render_sms_template(&config.title_template, message, context, false);
+        let body = render_sms_template(&config.common.sms_template, message, context, false);
         self.send_bark_message(config, title, body).await
     }
 
@@ -555,14 +590,15 @@ impl NotificationSender {
         &self,
         config: &PushPlusConfig,
         message: &SmsMessage,
+        context: &SmsTemplateContext,
         force: bool,
     ) -> Result<String, String> {
         if !should_send_sms(&config.common, force) {
             return Ok("PushPlus skipped".to_string());
         }
 
-        let title = render_sms_template(&config.title_template, message, false);
-        let content = render_sms_template(&config.common.sms_template, message, false);
+        let title = render_sms_template(&config.title_template, message, context, false);
+        let content = render_sms_template(&config.common.sms_template, message, context, false);
         self.send_pushplus_message(config, title, content).await
     }
 
@@ -641,12 +677,13 @@ impl NotificationSender {
         &self,
         config: &WecomAppConfig,
         message: &SmsMessage,
+        context: &SmsTemplateContext,
         force: bool,
     ) -> Result<String, String> {
         if !should_send_sms(&config.common, force) {
             return Ok("企业微信应用消息 skipped".to_string());
         }
-        let text = render_sms_template(&config.common.sms_template, message, false);
+        let text = render_sms_template(&config.common.sms_template, message, context, false);
         self.send_wecom_app_text(config, text).await
     }
 
@@ -865,12 +902,13 @@ impl NotificationSender {
         &self,
         config: &WecomRobotConfig,
         message: &SmsMessage,
+        context: &SmsTemplateContext,
         force: bool,
     ) -> Result<String, String> {
         if !should_send_sms(&config.common, force) {
             return Ok("企业微信群机器人 skipped".to_string());
         }
-        let text = render_sms_template(&config.common.sms_template, message, false);
+        let text = render_sms_template(&config.common.sms_template, message, context, false);
         self.send_wecom_robot_text(config, text).await
     }
 
@@ -933,12 +971,13 @@ impl NotificationSender {
         &self,
         config: &DingtalkRobotConfig,
         message: &SmsMessage,
+        context: &SmsTemplateContext,
         force: bool,
     ) -> Result<String, String> {
         if !should_send_sms(&config.common, force) {
             return Ok("钉钉群自定义机器人 skipped".to_string());
         }
-        let text = render_sms_template(&config.common.sms_template, message, false);
+        let text = render_sms_template(&config.common.sms_template, message, context, false);
         self.send_dingtalk_robot_text(config, text).await
     }
 
@@ -1019,12 +1058,13 @@ impl NotificationSender {
         &self,
         config: &DingtalkAppConfig,
         message: &SmsMessage,
+        context: &SmsTemplateContext,
         force: bool,
     ) -> Result<String, String> {
         if !should_send_sms(&config.common, force) {
             return Ok("钉钉企业内机器人 skipped".to_string());
         }
-        let text = render_sms_template(&config.common.sms_template, message, false);
+        let text = render_sms_template(&config.common.sms_template, message, context, false);
         self.send_dingtalk_app_text(config, text).await
     }
 
@@ -1161,12 +1201,13 @@ impl NotificationSender {
         &self,
         config: &FeishuRobotConfig,
         message: &SmsMessage,
+        context: &SmsTemplateContext,
         force: bool,
     ) -> Result<String, String> {
         if !should_send_sms(&config.common, force) {
             return Ok("飞书机器人 skipped".to_string());
         }
-        let text = render_sms_template(&config.common.sms_template, message, false);
+        let text = render_sms_template(&config.common.sms_template, message, context, false);
         self.send_feishu_robot_text(config, text).await
     }
 
@@ -1236,12 +1277,13 @@ impl NotificationSender {
         &self,
         config: &TelegramConfig,
         message: &SmsMessage,
+        context: &SmsTemplateContext,
         force: bool,
     ) -> Result<String, String> {
         if !should_send_sms(&config.common, force) {
             return Ok("Telegram skipped".to_string());
         }
-        let text = render_sms_template(&config.common.sms_template, message, false);
+        let text = render_sms_template(&config.common.sms_template, message, context, false);
         self.send_telegram_text(config, text).await
     }
 
@@ -1642,17 +1684,31 @@ fn response_result(label: &str, status: StatusCode, body: String) -> Result<Stri
     Ok(format!("{} test successful (status: {})", label, status))
 }
 
-fn render_sms_template(template: &str, message: &SmsMessage, escape_json: bool) -> String {
+fn render_sms_template(
+    template: &str,
+    message: &SmsMessage,
+    context: &SmsTemplateContext,
+    escape_json: bool,
+) -> String {
     let content = if escape_json {
         escape_json_string(&message.content)
     } else {
         message.content.clone()
+    };
+    let own_number = if escape_json {
+        escape_json_string(&context.own_number)
+    } else {
+        context.own_number.clone()
     };
     let timestamp = render_time_value(&message.timestamp, escape_json);
 
     template
         .replace("{{id}}", &message.id.to_string())
         .replace("{{phone_number}}", &message.phone_number)
+        .replace("{{own_number}}", &own_number)
+        .replace("{{local_phone_number}}", &own_number)
+        .replace("{{self_phone_number}}", &own_number)
+        .replace("{{本机号码}}", &own_number)
         .replace("{{content}}", &content)
         .replace("{{direction}}", &message.direction)
         .replace("{{timestamp}}", &timestamp)
@@ -1783,10 +1839,37 @@ mod tests {
             status: "received".to_string(),
             pdu: None,
         };
+        let context = SmsTemplateContext::default();
 
         assert_eq!(
-            render_sms_template("{{timestamp}}|{{time}}", &message, false),
+            render_sms_template("{{timestamp}}|{{time}}", &message, &context, false),
             "2026-05-15 00:30:45|2026-05-15 00:30:45"
+        );
+    }
+
+    #[test]
+    fn renders_sms_own_number_variables() {
+        let message = SmsMessage {
+            id: 7,
+            direction: "incoming".to_string(),
+            phone_number: "+8613800138000".to_string(),
+            content: "hello".to_string(),
+            timestamp: "2026-05-14T16:30:45Z".to_string(),
+            status: "received".to_string(),
+            pdu: None,
+        };
+        let context = SmsTemplateContext {
+            own_number: "+8613912345678".to_string(),
+        };
+
+        assert_eq!(
+            render_sms_template(
+                "{{own_number}}|{{local_phone_number}}|{{self_phone_number}}|{{本机号码}}",
+                &message,
+                &context,
+                false
+            ),
+            "+8613912345678|+8613912345678|+8613912345678|+8613912345678"
         );
     }
 

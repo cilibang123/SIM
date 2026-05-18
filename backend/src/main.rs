@@ -172,7 +172,11 @@ async fn main() -> Result<()> {
     tracing::info!(result = %nm_result, "NetworkManager modem ownership check completed");
 
     // 初始化通知发送器
-    let notification_sender = Arc::new(NotificationSender::new(Arc::clone(&config_manager)));
+    let notification_sender = Arc::new(NotificationSender::new(
+        Arc::clone(&config_manager),
+        Arc::clone(&dbus_conn),
+        Arc::clone(&app_db),
+    ));
     let ddns_manager = Arc::new(DdnsManager::new());
 
     {

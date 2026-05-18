@@ -57,6 +57,13 @@ pub struct SmscCacheEntry {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OwnNumberCacheEntry {
+    pub phone_numbers: Vec<String>,
+    pub source: String,
+    pub updated_at: String,
+}
+
 /// 数据库管理器
 pub struct Database {
     conn: Arc<Mutex<Connection>>,
@@ -126,6 +133,19 @@ impl Database {
                 imsi TEXT,
                 operator_id TEXT,
                 sms_center TEXT NOT NULL,
+                source TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )",
+            [],
+        )?;
+
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS own_number_cache (
+                identity_key TEXT PRIMARY KEY,
+                iccid TEXT,
+                imsi TEXT,
+                operator_id TEXT,
+                phone_numbers TEXT NOT NULL,
                 source TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )",
@@ -388,6 +408,83 @@ impl Database {
                     |row| {
                         Ok(SmscCacheEntry {
                             sms_center: row.get(0)?,
+                            source: row.get(1)?,
+                            updated_at: row.get(2)?,
+                        })
+                    },
+                )
+                .optional()?;
+            if entry.is_some() {
+                return Ok(entry);
+            }
+        }
+        Ok(None)
+    }
+
+    // ==================== Own number cache ====================
+
+    pub fn upsert_own_number_cache(
+        &self,
+        identity_key: &str,
+        iccid: &str,
+        imsi: &str,
+        operator_id: &str,
+        phone_numbers: &[String],
+        source: &str,
+    ) -> Result<()> {
+        if phone_numbers.is_empty() {
+            return Ok(());
+        }
+
+        let conn = self.conn.lock().unwrap();
+        let updated_at = Utc::now().to_rfc3339();
+        let phone_numbers = phone_numbers.join("\n");
+        conn.execute(
+            "INSERT INTO own_number_cache (
+                identity_key, iccid, imsi, operator_id, phone_numbers, source, updated_at
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(identity_key) DO UPDATE SET
+                iccid = excluded.iccid,
+                imsi = excluded.imsi,
+                operator_id = excluded.operator_id,
+                phone_numbers = excluded.phone_numbers,
+                source = excluded.source,
+                updated_at = excluded.updated_at",
+            params![
+                identity_key,
+                iccid,
+                imsi,
+                operator_id,
+                phone_numbers,
+                source,
+                updated_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_own_number_cache(
+        &self,
+        identity_keys: &[String],
+    ) -> Result<Option<OwnNumberCacheEntry>> {
+        let conn = self.conn.lock().unwrap();
+        for key in identity_keys {
+            let entry = conn
+                .query_row(
+                    "SELECT phone_numbers, source, updated_at
+                     FROM own_number_cache
+                     WHERE identity_key = ?1",
+                    params![key],
+                    |row| {
+                        let phone_numbers: String = row.get(0)?;
+                        Ok(OwnNumberCacheEntry {
+                            phone_numbers: phone_numbers
+                                .lines()
+                                .map(str::trim)
+                                .filter(|line| !line.is_empty())
+                                .map(ToString::to_string)
+                                .collect(),
                             source: row.get(1)?,
                             updated_at: row.get(2)?,
                         })
