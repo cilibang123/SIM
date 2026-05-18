@@ -1,6 +1,7 @@
 //! Shared request and response models for the active SimAdmin backend.
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::db::{CallRecord, CallStats, SmsMessage, SmsStats};
 
@@ -33,6 +34,132 @@ where
             data: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkMode {
+    #[default]
+    Sim,
+    Esim,
+}
+
+impl std::fmt::Display for WorkMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WorkMode::Sim => write!(f, "sim"),
+            WorkMode::Esim => write!(f, "esim"),
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct WorkModeRequest {
+    pub mode: WorkMode,
+    #[serde(default)]
+    pub confirm: bool,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct WorkModeResponse {
+    pub mode: WorkMode,
+    pub worker_running: bool,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, Clone)]
+pub struct EsimCommandResponse {
+    #[serde(default)]
+    pub code: i32,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub action: String,
+    #[serde(default)]
+    pub msg: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<Value>,
+}
+
+#[derive(Debug, Default, Serialize, Clone)]
+pub struct EsimEuiccInfo {
+    pub eid: String,
+    pub status: String,
+    pub manufacturer: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_total_kb: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_available_kb: Option<f64>,
+    #[serde(default)]
+    pub raw: Value,
+}
+
+#[derive(Debug, Default, Serialize, Clone)]
+pub struct EsimProfile {
+    pub iccid: String,
+    pub name: String,
+    pub provider: String,
+    pub state: String,
+    #[serde(rename = "class")]
+    pub profile_class: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub imsi: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub msisdn: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub smsc: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub smdp: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub isdp_aid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcc: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mnc: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disable_allowed: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delete_allowed: Option<bool>,
+    #[serde(default)]
+    pub raw: Value,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct EsimProfilesResponse {
+    pub profiles: Vec<EsimProfile>,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct EsimLpacStatusResponse {
+    pub installed: bool,
+    pub usable: bool,
+    pub path: String,
+    pub arch: String,
+    pub glibc_version: String,
+    pub asset_name: String,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct EsimLpacRepairRequest {
+    pub proxy_prefix: Option<String>,
+    pub asset_url: Option<String>,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct EsimLpacRepairResponse {
+    pub installed: bool,
+    pub path: String,
+    pub arch: String,
+    pub asset_name: String,
+    pub asset_url: String,
+    pub message: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct EsimRenameRequest {
+    pub name: String,
 }
 
 #[derive(Debug, Default, Serialize, Clone)]

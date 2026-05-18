@@ -13,7 +13,10 @@ use zbus::{
     Connection, Proxy,
 };
 
-use crate::{config::ConfigManager, db::Database};
+use crate::{
+    config::{ApnConfig, ConfigManager},
+    db::Database,
+};
 use crate::{
     models::{
         AirplaneModeResponse, ApnContext, ApnListResponse, BandLockRequest, BandLockStatus,
@@ -65,6 +68,11 @@ const MM_MODEM_PORT_TYPE_AT: u32 = 3;
 const MM_MODEM_PORT_TYPE_QMI: u32 = 6;
 const MM_MODEM_PORT_TYPE_MBIM: u32 = 7;
 const MODEM_HELPER_COMMAND_TIMEOUT_SECS: u64 = 3;
+const MODEM_AT_COMMAND_TIMEOUT_SECS: u64 = 2;
+const SMSC_HELPER_FALLBACK_TIMEOUT_SECS: u64 = 4;
+const SMSC_BACKGROUND_AT_TIMEOUT_SECS: u64 = 10;
+
+static SMSC_BACKGROUND_RUNNING: AtomicBool = AtomicBool::new(false);
 
 type InterfaceProperties = HashMap<String, OwnedValue>;
 type ManagedObjects = HashMap<OwnedObjectPath, HashMap<String, InterfaceProperties>>;
@@ -77,6 +85,93 @@ static BASEBAND_RESTART_STEPS: std::sync::Mutex<Vec<BasebandRestartStep>> =
 static BASEBAND_RESTART_RUNNING: AtomicBool = AtomicBool::new(false);
 static BASEBAND_RESTART_REGISTRATION: std::sync::Mutex<Option<String>> =
     std::sync::Mutex::new(None);
+
+#[derive(Debug, Clone, Default)]
+struct SimpleConnectSettings {
+    apn: Option<String>,
+    user: Option<String>,
+    password: Option<String>,
+    ip_type: Option<u32>,
+    allowed_auth: Option<u32>,
+    source: Option<&'static str>,
+}
+
+impl SimpleConnectSettings {
+    fn has_apn(&self) -> bool {
+        self.apn
+            .as_deref()
+            .is_some_and(|apn| !apn.trim().is_empty())
+    }
+
+    fn fill_missing_from(&mut self, other: SimpleConnectSettings) {
+        if self.apn.is_none() {
+            self.apn = other.apn;
+            if self.apn.is_some() && self.source.is_none() {
+                self.source = other.source;
+            }
+        }
+        if self.user.is_none() {
+            self.user = other.user;
+        }
+        if self.password.is_none() {
+            self.password = other.password;
+        }
+        if self.ip_type.is_none() {
+            self.ip_type = other.ip_type;
+        }
+        if self.allowed_auth.is_none() {
+            self.allowed_auth = other.allowed_auth;
+        }
+    }
+}
+
+fn non_empty_string(value: String) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn property_string(props: &InterfaceProperties, key: &str) -> Option<String> {
+    props
+        .get(key)
+        .map(extract_string)
+        .and_then(non_empty_string)
+}
+
+fn apn_protocol_to_mm_ip_type(protocol: &str) -> Option<u32> {
+    match protocol.trim().to_ascii_lowercase().as_str() {
+        "" => None,
+        "ip" | "ipv4" => Some(1),
+        "ipv6" => Some(2),
+        "dual" | "ipv4v6" => Some(3),
+        _ => Some(3),
+    }
+}
+
+fn apn_config_to_simple_connect_settings(config: &ApnConfig) -> SimpleConnectSettings {
+    let apn = non_empty_string(config.apn.clone());
+    let source = apn.as_ref().map(|_| "config");
+    let mut settings = SimpleConnectSettings {
+        apn,
+        user: non_empty_string(config.username.clone()),
+        password: non_empty_string(config.password.clone()),
+        ip_type: apn_protocol_to_mm_ip_type(&config.protocol),
+        allowed_auth: None,
+        source,
+    };
+    let auth_method = config.auth_method.trim();
+    if (!auth_method.eq_ignore_ascii_case("chap")
+        || settings.user.is_some()
+        || settings.password.is_some())
+        && !auth_method.is_empty()
+    {
+        settings.allowed_auth = apn_auth_method_to_mm_allowed_auth(auth_method);
+    }
+    settings
+}
 
 async fn get_all_properties(
     conn: &Connection,
@@ -250,6 +345,177 @@ fn extract_smsc_property(props: &HashMap<String, OwnedValue>) -> String {
             if !smsc.is_empty() {
                 return smsc;
             }
+        }
+    }
+    String::new()
+}
+
+// ── EF_SMSP (AT+CRSM) SMSC 解析 ─────────────────────────────────────────
+
+/// 从十六进制字符串解析字节数组。
+fn decode_hex(hex: &str) -> Vec<u8> {
+    let hex = hex.trim();
+    let mut bytes = Vec::with_capacity(hex.len() / 2);
+    let mut chars = hex.chars();
+    while let (Some(hi), Some(lo)) = (chars.next(), chars.next()) {
+        if let (Some(h), Some(l)) = (hi.to_digit(16), lo.to_digit(16)) {
+            bytes.push((h as u8) << 4 | l as u8);
+        } else {
+            break;
+        }
+    }
+    bytes
+}
+
+/// 从 +CRSM GET RESPONSE 的 FCP 数据中提取线性定长文件的记录长度。
+///
+/// 输入示例: `+CRSM: 97,12,"62198205422100280583026F428A01"`
+/// FCP 中 tag 0x82 (File Descriptor) 长度 5 时格式为:
+///   [0x42(线性定长)] [数据编码] [记录长度高] [记录长度低] [记录数]
+fn parse_crsm_fcp_record_length(output: &str) -> usize {
+    for line in output.lines() {
+        let trimmed = line.trim();
+        // 寻找 +CRSM: 行
+        let crsm_start = match trimmed.find("+CRSM:") {
+            Some(pos) => pos,
+            None => continue,
+        };
+        let data_part = &trimmed[crsm_start + "+CRSM:".len()..];
+        // 提取引号中的十六进制数据
+        let hex_data = match first_quoted_value(data_part) {
+            Some(hex) => hex,
+            None => {
+                // 无引号时取逗号分隔的第三个字段
+                let fields: Vec<&str> = data_part.split(',').collect();
+                match fields.get(2) {
+                    Some(field) => field.trim().trim_matches('"').to_string(),
+                    None => continue,
+                }
+            }
+        };
+        let fcp = decode_hex(&hex_data);
+        // 跳过 FCP 模板外层 (tag 0x62 + length)，进入内层 TLV
+        let inner = if fcp.len() >= 2 && fcp[0] == 0x62 {
+            let inner_len = fcp[1] as usize;
+            if 2 + inner_len <= fcp.len() {
+                &fcp[2..2 + inner_len]
+            } else {
+                &fcp[2..]
+            }
+        } else {
+            &fcp[..]
+        };
+        // 在内层 TLV 中查找 tag 0x82 (File Descriptor)
+        let mut i = 0;
+        while i + 1 < inner.len() {
+            let tag = inner[i];
+            let len = inner[i + 1] as usize;
+            if tag == 0x82 && len >= 5 && i + 2 + len <= inner.len() {
+                // inner[i+2] = file descriptor byte (0x42 = linear fixed)
+                // inner[i+3] = data coding byte
+                // inner[i+4..i+6] = record length (big-endian u16)
+                let record_len = ((inner[i + 4] as usize) << 8) | (inner[i + 5] as usize);
+                if record_len >= 28 && record_len <= 256 {
+                    return record_len;
+                }
+            }
+            i += 2 + len;
+        }
+    }
+    0
+}
+
+/// 从 BCD 半字节交换编码的字节中解码电话号码。
+///
+/// BCD 编码: 每个字节的低 4 位在前、高 4 位在后, 0xF 为填充。
+/// 示例: [0x68, 0x31, 0x08, 0x10, 0x05, 0xF0] → "8613800100500"
+fn decode_bcd_digits(bytes: &[u8]) -> String {
+    let mut digits = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        let lo = byte & 0x0F;
+        let hi = (byte >> 4) & 0x0F;
+        if lo <= 9 {
+            digits.push((b'0' + lo) as char);
+        }
+        if hi <= 9 {
+            digits.push((b'0' + hi) as char);
+        }
+    }
+    digits
+}
+
+/// 从 EF_SMSP 记录的 TS-SCA 字段解码 SMSC 地址。
+///
+/// TS-SCA 格式 (12 字节):
+///   [长度] [类型 (0x91=国际/0x81=国内)] [BCD 编码号码 (最多 10 字节)]
+///   长度 = 后续有效字节数 (含类型字节)
+///   长度为 0x00 或 0xFF 表示未设置。
+fn decode_smsc_from_ts_sca(sca: &[u8]) -> String {
+    if sca.is_empty() {
+        return String::new();
+    }
+    let len = sca[0] as usize;
+    if len == 0 || len == 0xFF || len < 2 || 1 + len > sca.len() {
+        return String::new();
+    }
+    let type_byte = sca[1];
+    let digit_bytes = &sca[2..1 + len];
+    let number = decode_bcd_digits(digit_bytes);
+    if number.is_empty() || number.chars().all(|c| c == '0') {
+        return String::new();
+    }
+    let formatted = if type_byte == 0x91 {
+        format!("+{number}")
+    } else {
+        number
+    };
+    normalize_smsc(&formatted)
+}
+
+/// 从 +CRSM READ RECORD 响应中解析 SMSC 地址。
+///
+/// 输入示例: `+CRSM: 144,0,"FFFF...07916831081005F0FFFFFF"`
+/// EF_SMSP 记录结构 (3GPP TS 31.102 4.2.27):
+///   [Alpha ID: record_len - 28 字节]
+///   [参数指示: 1 字节]
+///   [TP-DA: 12 字节]
+///   [TS-SCA: 12 字节]  ← SMSC 在这里
+///   [TP-PID: 1 字节]
+///   [TP-DCS: 1 字节]
+///   [TP-VP: 1 字节]
+fn parse_smsc_from_crsm_record(output: &str, record_len: usize) -> String {
+    for line in output.lines() {
+        let trimmed = line.trim();
+        let crsm_start = match trimmed.find("+CRSM:") {
+            Some(pos) => pos,
+            None => continue,
+        };
+        let data_part = &trimmed[crsm_start + "+CRSM:".len()..];
+        let fields: Vec<&str> = data_part.splitn(3, ',').collect();
+        // 检查 SW1=144(0x90) 表示成功
+        let sw1: u32 = fields
+            .first()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0);
+        if sw1 != 144 && sw1 != 145 {
+            continue;
+        }
+        let hex_data = match fields.get(2) {
+            Some(field) => field.trim().trim_matches('"').to_string(),
+            None => continue,
+        };
+        let record = decode_hex(&hex_data);
+        if record.len() < record_len {
+            continue;
+        }
+        // TS-SCA 起始位置: record_len - 28(固定部分) + 1(参数指示) + 12(TP-DA) = record_len - 15
+        let sca_offset = record_len - 15;
+        if sca_offset + 12 > record.len() {
+            continue;
+        }
+        let smsc = decode_smsc_from_ts_sca(&record[sca_offset..sca_offset + 12]);
+        if !smsc.is_empty() {
+            return smsc;
         }
     }
     String::new()
@@ -1291,7 +1557,217 @@ async fn direct_at_smsc_fallback(conn: &Connection) -> String {
     parse_smsc_from_at_output(&output)
 }
 
-async fn active_protocol_smsc_fallback(conn: &Connection, modem_path: &str) -> String {
+/// 通过 AT+CRSM 读取 SIM 卡 EF_SMSP 文件中的 SMSC 地址。
+/// 优先使用 ModemManager Modem.Command D-Bus 接口（需要 debug 模式），
+/// 直接串口作为 fallback。
+async fn direct_at_ef_smsp_fallback(conn: &Connection) -> String {
+    let modem_path = match find_modem_path(conn).await {
+        Ok(path) => path,
+        Err(err) => {
+            warn!(error = %err, "EF_SMSP fallback: cannot find modem path");
+            return String::new();
+        }
+    };
+
+    // 步骤 1: GET RESPONSE 获取 EF_SMSP 文件信息
+    let info_output = match send_at_via_modem_command(
+        conn,
+        &modem_path,
+        "AT+CRSM=192,28482,0,0,15",
+    )
+    .await
+    {
+        Ok(output) => output,
+        Err(err) => {
+            warn!(error = %err, "EF_SMSP fallback step 1 (Modem.Command) failed, trying direct serial");
+            // 直接串口兜底
+            match with_serial(async {
+                run_direct_at_command_draining(conn, "AT+CRSM=192,28482,0,0,15").await
+            })
+            .await
+            {
+                Ok(output) => output,
+                Err(err) => {
+                    warn!(error = %err, "EF_SMSP fallback step 1 (direct serial) also failed");
+                    return String::new();
+                }
+            }
+        }
+    };
+
+    let record_len = parse_crsm_fcp_record_length(&info_output);
+    if record_len == 0 {
+        warn!(
+            output = %info_output,
+            "EF_SMSP fallback: cannot parse record length from FCP response"
+        );
+        return String::new();
+    }
+    info!(
+        record_len = record_len,
+        "EF_SMSP record length parsed from FCP"
+    );
+
+    // 步骤 2: READ RECORD 读取第一条记录
+    let read_cmd = format!("AT+CRSM=178,28482,1,4,{record_len}");
+    let record_output = match send_at_via_modem_command(conn, &modem_path, &read_cmd).await {
+        Ok(output) => output,
+        Err(err) => {
+            warn!(error = %err, "EF_SMSP fallback step 2 (Modem.Command) failed, trying direct serial");
+            match with_serial(async {
+                run_direct_at_command_draining(conn, &read_cmd).await
+            })
+            .await
+            {
+                Ok(output) => output,
+                Err(err) => {
+                    warn!(error = %err, "EF_SMSP fallback step 2 (direct serial) also failed");
+                    return String::new();
+                }
+            }
+        }
+    };
+
+    let smsc = parse_smsc_from_crsm_record(&record_output, record_len);
+    if smsc.is_empty() {
+        warn!(
+            output = %record_output,
+            record_len = record_len,
+            "EF_SMSP fallback: parsed empty SMSC from record"
+        );
+    }
+    smsc
+}
+
+/// 通过 ModemManager D-Bus Modem.Command 发送 AT 指令。
+/// 在发送前动态将 ModemManager 日志级别提权到 DEBUG，发送后恢复为 INFO，
+/// 从而绕过普通模式下的 Unauthorized 错误，且不长期影响系统性能。
+async fn send_at_via_modem_command(
+    conn: &Connection,
+    modem_path: &str,
+    command: &str,
+) -> Result<String, String> {
+    // 动态提权到 DEBUG 模式
+    let mm_proxy = Proxy::new(
+        conn,
+        MM_SERVICE,
+        "/org/freedesktop/ModemManager1",
+        "org.freedesktop.ModemManager1",
+    )
+    .await;
+    if let Ok(proxy) = &mm_proxy {
+        let _ = proxy.call::<_, _, ()>("SetLogging", &("DEBUG")).await;
+    }
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(SMSC_BACKGROUND_AT_TIMEOUT_SECS),
+        with_serial(async {
+            let proxy = Proxy::new(conn, MM_SERVICE, modem_path, MM_MODEM).await?;
+            proxy
+                .call::<_, _, String>(
+                    "Command",
+                    &(command, SMSC_BACKGROUND_AT_TIMEOUT_SECS as u32),
+                )
+                .await
+        }),
+    )
+    .await;
+
+    // 无论成功、失败或超时，立即恢复为 INFO 模式
+    if let Ok(proxy) = &mm_proxy {
+        let _ = proxy.call::<_, _, ()>("SetLogging", &("INFO")).await;
+    }
+
+    match result {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(err)) => Err(format!("Modem.Command error: {err}")),
+        Err(_) => Err("Modem.Command timeout".to_string()),
+    }
+}
+
+/// 后台异步获取 SMSC 并写入缓存。
+/// 优先使用 AT+CRSM 读 EF_SMSP（可靠且快速）。
+/// 需要 ModemManager 以 --debug 模式运行以支持 Modem.Command 接口。
+pub async fn background_fetch_smsc(conn: &Connection, db: &Database) {
+    if SMSC_BACKGROUND_RUNNING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
+    let result = background_fetch_smsc_inner(conn, db).await;
+    SMSC_BACKGROUND_RUNNING.store(false, Ordering::SeqCst);
+    result
+}
+
+async fn background_fetch_smsc_inner(conn: &Connection, db: &Database) {
+
+    let identity = current_sim_identity(conn).await;
+    let identity = match identity {
+        Some(id) if !id.iccid.is_empty() || !id.imsi.is_empty() => id,
+        _ => {
+            info!("Background SMSC fetch skipped: no SIM identity");
+            return;
+        }
+    };
+
+    // 已有缓存则跳过
+    let cached = cached_smsc_for_identity(db, &identity);
+    if !cached.is_empty() {
+        return;
+    }
+
+    info!("Background SMSC fetch starting");
+
+    // 方法 1: AT+CRSM 读取 EF_SMSP（最可靠）
+    let smsc = direct_at_ef_smsp_fallback(conn).await;
+    if !smsc.is_empty() {
+        cache_smsc_for_identity(db, &identity, &smsc, "ef_smsp");
+        info!(smsc = %smsc, "Background SMSC fetch succeeded via EF_SMSP");
+        return;
+    }
+
+    // 方法 2: AT+CSCA? 通过 Modem.Command
+    let modem_path = find_modem_path(conn).await.ok();
+    if let Some(ref path) = modem_path {
+        match send_at_via_modem_command(conn, path, "AT+CSCA?").await {
+            Ok(output) => {
+                let smsc = parse_smsc_from_at_output(&output);
+                if !smsc.is_empty() {
+                    cache_smsc_for_identity(db, &identity, &smsc, "background_at");
+                    info!(smsc = %smsc, "Background SMSC fetch succeeded via AT+CSCA?");
+                    return;
+                }
+            }
+            Err(err) => {
+                warn!(error = %err, "Background SMSC fetch: AT+CSCA? via Modem.Command failed");
+            }
+        }
+    }
+
+    info!("Background SMSC fetch: all methods exhausted");
+}
+
+async fn modem_command_smsc_fallback(conn: &Connection, modem_path: &str) -> String {
+    let result = tokio::time::timeout(
+        Duration::from_secs(MODEM_AT_COMMAND_TIMEOUT_SECS),
+        with_serial(async {
+            let proxy = Proxy::new(conn, MM_SERVICE, modem_path, MM_MODEM).await?;
+            proxy
+                .call::<_, _, String>(
+                    "Command",
+                    &("AT+CSCA?", MODEM_AT_COMMAND_TIMEOUT_SECS as u32),
+                )
+                .await
+        }),
+    )
+    .await;
+
+    match result {
+        Ok(Ok(output)) => parse_smsc_from_at_output(&output),
+        _ => String::new(),
+    }
+}
+
+async fn helper_protocol_smsc_fallback(conn: &Connection, modem_path: &str) -> String {
     let smsc = mbim_sms_config_smsc_fallback(conn, modem_path).await;
     if !smsc.is_empty() {
         return smsc;
@@ -1309,6 +1785,20 @@ async fn active_protocol_smsc_fallback(conn: &Connection, modem_path: &str) -> S
         return smsc;
     }
     direct_at_smsc_fallback(conn).await
+}
+
+async fn active_protocol_smsc_fallback(conn: &Connection, modem_path: &str) -> String {
+    let smsc = modem_command_smsc_fallback(conn, modem_path).await;
+    if !smsc.is_empty() {
+        return smsc;
+    }
+
+    tokio::time::timeout(
+        Duration::from_secs(SMSC_HELPER_FALLBACK_TIMEOUT_SECS),
+        helper_protocol_smsc_fallback(conn, modem_path),
+    )
+    .await
+    .unwrap_or_default()
 }
 
 pub async fn get_sim_info_data_with_cache(
@@ -1567,6 +2057,75 @@ fn qmi_device_path(port: &str) -> String {
     } else {
         format!("/dev/{port}")
     }
+}
+
+#[cfg(unix)]
+fn qmi_device_exists(path: &str) -> bool {
+    fs::metadata(path).is_ok()
+}
+
+#[cfg(not(unix))]
+fn qmi_device_exists(_path: &str) -> bool {
+    false
+}
+
+#[cfg(unix)]
+fn find_qmi_device_path() -> Option<String> {
+    let mut candidates = vec!["/dev/wwan0qmi0".to_string()];
+    if let Ok(entries) = fs::read_dir("/dev") {
+        let mut qmi_ports = Vec::new();
+        let mut cdc_wdm_ports = Vec::new();
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let path = format!("/dev/{name}");
+            if name.starts_with("wwan") && name.contains("qmi") {
+                qmi_ports.push(path);
+            } else if name.starts_with("cdc-wdm") {
+                cdc_wdm_ports.push(path);
+            }
+        }
+        qmi_ports.sort();
+        cdc_wdm_ports.sort();
+        candidates.extend(qmi_ports);
+        candidates.extend(cdc_wdm_ports);
+    }
+    candidates.into_iter().find(|path| qmi_device_exists(path))
+}
+
+#[cfg(not(unix))]
+fn find_qmi_device_path() -> Option<String> {
+    None
+}
+
+async fn wait_for_qmi_device_path(preferred: Option<&str>, timeout: Duration) -> Option<String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(path) = preferred.filter(|path| qmi_device_exists(path)) {
+            return Some(path.to_string());
+        }
+        if let Some(path) = find_qmi_device_path() {
+            return Some(path);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+async fn qmicli_sim_power(device: &str, enabled: bool) -> Result<String, String> {
+    let action = if enabled {
+        "--uim-sim-power-on=1"
+    } else {
+        "--uim-sim-power-off=1"
+    };
+    let args = vec![
+        "-p".to_string(),
+        "-d".to_string(),
+        device.to_string(),
+        action.to_string(),
+    ];
+    run_recovery_command_owned("qmicli", &args, Duration::from_secs(20)).await
 }
 
 fn looks_like_qmi_control_port(port: &str) -> bool {
@@ -1890,71 +2449,68 @@ LTE Timing Advance: 'unavailable'"#;
 
     #[test]
     fn parses_smsc_from_direct_at_output() {
-        let output = "AT+CSCA?\r\r\n+CSCA: \"+8613800100500\",145\r\n\r\nOK\r\n";
+        let output = "AT+CSCA?\r\r\n+CSCA: \"+10000\",145\r\n\r\nOK\r\n";
 
-        assert_eq!(parse_smsc_from_at_output(output), "+8613800100500");
+        assert_eq!(parse_smsc_from_at_output(output), "+10000");
     }
 
     #[test]
     fn parses_smsc_from_mmcli_wrapped_output() {
-        let output = "response: '+CSCA: \"+8613800100500\",145'";
+        let output = "response: '+CSCA: \"+10000\",145'";
 
-        assert_eq!(parse_smsc_from_at_output(output), "+8613800100500");
+        assert_eq!(parse_smsc_from_at_output(output), "+10000");
     }
 
     #[test]
     fn extracts_smsc_from_protocol_output() {
-        let output = "SMSC Address\n  Type: 'international'\n  Number: '+34644109030'";
+        let output = "SMSC Address\n  Type: 'international'\n  Number: '+10001'";
 
-        assert_eq!(extract_smsc_from_text(output), "+34644109030");
+        assert_eq!(extract_smsc_from_text(output), "+10001");
     }
 
     #[test]
     fn parses_own_numbers_from_at_cnum_output() {
-        let output = "AT+CNUM\r\r\n+CNUM: \"Voice\",\"+8613912345678\",145\r\n+CNUM: \"Data\",\"13987654321\",129\r\n\r\nOK\r\n";
+        let output = "AT+CNUM\r\r\n+CNUM: \"Voice\",\"+10002\",145\r\n+CNUM: \"Data\",\"10003\",129\r\n\r\nOK\r\n";
 
         assert_eq!(
             parse_own_numbers_from_at_output(output),
-            vec!["+8613912345678".to_string(), "13987654321".to_string()]
+            vec!["+10002".to_string(), "10003".to_string()]
         );
     }
 
     #[test]
     fn parses_own_numbers_from_wrapped_at_cnum_output() {
-        let output = "response: '+CNUM: \"\",\"+447700900123\",145'";
+        let output = "response: '+CNUM: \"\",\"+10004\",145'";
 
         assert_eq!(
             parse_own_numbers_from_at_output(output),
-            vec!["+447700900123".to_string()]
+            vec!["+10004".to_string()]
         );
     }
 
     #[test]
     fn parses_own_numbers_from_qmi_msisdn_output() {
-        let output = "[/dev/cdc-wdm0] Successfully got MSISDN:\n\tMSISDN: '+15551234567'";
+        let output = "[/dev/cdc-wdm0] Successfully got MSISDN:\n\tMSISDN: '+10005'";
 
         assert_eq!(
             parse_own_numbers_from_labeled_text(output),
-            vec!["+15551234567".to_string()]
+            vec!["+10005".to_string()]
         );
     }
 
     #[test]
     fn parses_own_numbers_from_mbim_subscriber_output() {
-        let output = "Subscriber ready status retrieved:\n  Ready state: 'initialized'\n  Subscriber ID: '310260123456789'\n  Telephone numbers: (1)\n    [0]: '+15557654321'";
+        let output = "Subscriber ready status retrieved:\n  Ready state: 'initialized'\n  Subscriber ID: '001010'\n  Telephone numbers: (1)\n    [0]: '+10006'";
 
         assert_eq!(
             parse_own_numbers_from_labeled_text(output),
-            vec!["+15557654321".to_string()]
+            vec!["+10006".to_string()]
         );
     }
 
     #[test]
     fn normalizes_and_rejects_invalid_own_numbers() {
-        assert_eq!(
-            normalize_phone_number(" tel:+1 (555) 123-4567 "),
-            "+15551234567"
-        );
+        assert_eq!(normalize_phone_number(" tel:+1 (000) 7 "), "+10007");
         assert_eq!(normalize_phone_number("145"), "");
         assert_eq!(normalize_phone_number("000000"), "");
     }
@@ -1962,19 +2518,19 @@ LTE Timing Advance: 'unavailable'"#;
     #[test]
     fn binds_own_number_cache_to_iccid_only() {
         let identity = SimIdentity {
-            iccid: "89860012345678901234".to_string(),
-            imsi: "460001234567890".to_string(),
-            operator_id: "46000".to_string(),
+            iccid: "TEST_ICCID_001".to_string(),
+            imsi: "001010".to_string(),
+            operator_id: "00101".to_string(),
         };
         assert_eq!(
             own_number_identity_key(&identity),
-            Some("iccid:89860012345678901234".to_string())
+            Some("iccid:TEST_ICCID_001".to_string())
         );
 
         let identity_without_iccid = SimIdentity {
             iccid: String::new(),
-            imsi: "460001234567890".to_string(),
-            operator_id: "46000".to_string(),
+            imsi: "001010".to_string(),
+            operator_id: "00101".to_string(),
         };
         assert_eq!(own_number_identity_key(&identity_without_iccid), None);
     }
@@ -1988,19 +2544,19 @@ LTE Timing Advance: 'unavailable'"#;
 
     #[test]
     fn derives_china_operator_code_from_imsi_with_two_digit_mnc() {
-        assert_eq!(operator_code_from_imsi("460027004736506"), "46002");
+        assert_eq!(operator_code_from_imsi("460020"), "46002");
         assert_eq!(
-            split_operator_code(&operator_code_from_imsi("460027004736506")),
+            split_operator_code(&operator_code_from_imsi("460020")),
             ("460".into(), "02".into())
         );
     }
 
     #[test]
     fn derives_non_china_operator_code_with_three_digit_mnc_fallback() {
-        assert_eq!(operator_code_from_imsi("310260123456789"), "310260");
+        assert_eq!(operator_code_from_imsi("001010"), "001010");
         assert_eq!(
-            split_operator_code(&operator_code_from_imsi("310260123456789")),
-            ("310".into(), "260".into())
+            split_operator_code(&operator_code_from_imsi("001010")),
+            ("001".into(), "010".into())
         );
     }
 
@@ -2009,6 +2565,122 @@ LTE Timing Advance: 'unavailable'"#;
         assert_eq!(operator_code_from_imsi(""), "");
         assert_eq!(operator_code_from_imsi("4600"), "");
         assert_eq!(operator_code_from_imsi("46002abc"), "");
+    }
+
+    // ── EF_SMSP / AT+CRSM 解析测试 ──
+
+    #[test]
+    fn parses_crsm_fcp_record_length_china_sim() {
+        // 实测数据: 中国移动/联通, record_length = 40 (0x28), 5 条记录
+        let output = "+CRSM: 97,12,\"62198205422100280583026F428A01\"";
+        assert_eq!(parse_crsm_fcp_record_length(output), 40);
+    }
+
+    #[test]
+    fn parses_crsm_fcp_record_length_austria_esim() {
+        // 实测数据: 奥地利 eSIM, record_length = 42 (0x2A), 1 条记录
+        let output = "+CRSM: 97,12,\"621982054221002A0183026F428A01\"";
+        assert_eq!(parse_crsm_fcp_record_length(output), 42);
+    }
+
+    #[test]
+    fn parses_crsm_fcp_record_length_with_at_echo() {
+        let output =
+            "AT+CRSM=192,28482,0,0,15\r\r\n+CRSM: 97,12,\"62198205422100280583026F428A01\"\r\n\r\nOK\r\n";
+        assert_eq!(parse_crsm_fcp_record_length(output), 40);
+    }
+
+    #[test]
+    fn returns_zero_for_invalid_crsm_fcp() {
+        assert_eq!(parse_crsm_fcp_record_length("ERROR"), 0);
+        assert_eq!(parse_crsm_fcp_record_length("+CRSM: 106,130"), 0);
+        assert_eq!(parse_crsm_fcp_record_length(""), 0);
+    }
+
+    #[test]
+    fn decodes_bcd_china_mobile_smsc() {
+        // +8613800290500: BCD 编码 68 31 08 20 09 05 F0
+        let digits = decode_bcd_digits(&[0x68, 0x31, 0x08, 0x20, 0x09, 0x05, 0xF0]);
+        assert_eq!(digits, "8613800290500");
+    }
+
+    #[test]
+    fn decodes_bcd_uk_smsc() {
+        // +447870002308: BCD 编码 44 87 07 00 32 80
+        let digits = decode_bcd_digits(&[0x44, 0x87, 0x07, 0x00, 0x32, 0x80]);
+        assert_eq!(digits, "447870002308");
+    }
+
+    #[test]
+    fn decodes_smsc_from_ts_sca_international() {
+        // 长度=8, 类型=0x91(国际), BCD: 68 31 08 20 09 05 F0 → +8613800290500
+        // 长度 = 1(类型字节) + 7(BCD字节) = 8
+        let sca = [0x08, 0x91, 0x68, 0x31, 0x08, 0x20, 0x09, 0x05, 0xF0, 0xFF, 0xFF, 0xFF];
+        assert_eq!(decode_smsc_from_ts_sca(&sca), "+8613800290500");
+    }
+
+    #[test]
+    fn decodes_smsc_from_ts_sca_empty() {
+        let sca = [0xFF; 12];
+        assert_eq!(decode_smsc_from_ts_sca(&sca), "");
+
+        let sca = [0x00; 12];
+        assert_eq!(decode_smsc_from_ts_sca(&sca), "");
+    }
+
+    #[test]
+    fn parses_smsc_from_crsm_record_china_mobile() {
+        // 40 字节记录, TS-SCA 从偏移 25 开始 (40 - 15 = 25)
+        // Alpha ID (12 bytes) + Parameter Indicators (1) + TP-DA (12) + TS-SCA (12) + PID+DCS+VP (3)
+        let mut record_hex = "FF".repeat(12); // Alpha ID
+        record_hex += "FF"; // Parameter Indicators
+        record_hex += &"FF".repeat(12); // TP-DA
+        record_hex += "0891683108200905F0FFFFFF"; // TS-SCA: len=8, type=0x91, +8613800290500
+        record_hex += "FFFFFF"; // PID + DCS + VP
+        let output = format!("+CRSM: 144,0,\"{record_hex}\"");
+        assert_eq!(
+            parse_smsc_from_crsm_record(&output, 40),
+            "+8613800290500"
+        );
+    }
+
+    #[test]
+    fn parses_smsc_from_crsm_record_empty_sca() {
+        let record_hex = "FF".repeat(40);
+        let output = format!("+CRSM: 144,0,\"{record_hex}\"");
+        assert_eq!(parse_smsc_from_crsm_record(&output, 40), "");
+    }
+
+    #[test]
+    fn parses_smsc_from_crsm_record_with_at_echo() {
+        let mut record_hex = "FF".repeat(12);
+        record_hex += "FF";
+        record_hex += &"FF".repeat(12);
+        record_hex += "0891683108200905F0FFFFFF";
+        record_hex += "FFFFFF";
+        let output = format!(
+            "AT+CRSM=178,28482,1,4,40\r\r\n+CRSM: 144,0,\"{record_hex}\"\r\n\r\nOK\r\n"
+        );
+        assert_eq!(
+            parse_smsc_from_crsm_record(&output, 40),
+            "+8613800290500"
+        );
+    }
+
+    #[test]
+    fn maps_known_china_operator_codes_to_default_apn() {
+        assert_eq!(default_apn_for_operator_code("46001"), Some("3gnet"));
+        assert_eq!(default_apn_for_operator_code("460-03"), Some("ctnet"));
+        assert_eq!(default_apn_for_operator_code("460020"), Some("cmnet"));
+        assert_eq!(default_apn_for_operator_code("00101"), None);
+    }
+
+    #[test]
+    fn maps_apn_protocol_to_modemmanager_ip_type() {
+        assert_eq!(apn_protocol_to_mm_ip_type("ip"), Some(1));
+        assert_eq!(apn_protocol_to_mm_ip_type("ipv6"), Some(2));
+        assert_eq!(apn_protocol_to_mm_ip_type("dual"), Some(3));
+        assert_eq!(apn_protocol_to_mm_ip_type(""), None);
     }
 
     #[test]
@@ -2518,10 +3190,209 @@ pub async fn set_band_lock(conn: &Connection, req: &BandLockRequest) -> zbus::Re
     .await
 }
 
-pub async fn set_data_connection(
+async fn known_bearer_paths(conn: &Connection, modem_path: &str) -> zbus::Result<Vec<String>> {
+    let mut paths =
+        extract_object_path_array(&get_property(conn, modem_path, MM_MODEM, "Bearers").await?);
+
+    if let Ok(value) = get_property(conn, modem_path, MM_MODEM, "InitialBearer").await {
+        let initial_bearer = extract_string(&value);
+        if !initial_bearer.is_empty() && initial_bearer != "/" {
+            paths.push(initial_bearer);
+        }
+    }
+
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}
+
+fn simple_connect_settings_from_bearer_props(props: &InterfaceProperties) -> SimpleConnectSettings {
+    let settings = extract_bearer_settings(props);
+    let ip_type = props
+        .get("IpType")
+        .or_else(|| settings.get("ip-type"))
+        .map(extract_u32)
+        .filter(|v| *v > 0);
+    let allowed_auth = props
+        .get("AllowedAuth")
+        .or_else(|| settings.get("allowed-auth"))
+        .map(extract_u32)
+        .filter(|v| *v > 0);
+
+    SimpleConnectSettings {
+        apn: property_string(props, "Apn").or_else(|| property_string(&settings, "apn")),
+        user: property_string(props, "User").or_else(|| property_string(&settings, "user")),
+        password: property_string(props, "Password")
+            .or_else(|| property_string(&settings, "password")),
+        ip_type,
+        allowed_auth,
+        source: Some("bearer"),
+    }
+}
+
+async fn read_bearer_simple_connect_settings(
+    conn: &Connection,
+    modem_path: &str,
+) -> SimpleConnectSettings {
+    let mut selected = SimpleConnectSettings::default();
+    let bearer_paths = match known_bearer_paths(conn, modem_path).await {
+        Ok(paths) => paths,
+        Err(err) => {
+            warn!(error = %err, "Failed to read ModemManager bearer paths for APN lookup");
+            return selected;
+        }
+    };
+
+    for path in bearer_paths {
+        match get_all_properties(conn, &path, MM_BEARER).await {
+            Ok(props) => {
+                let settings = simple_connect_settings_from_bearer_props(&props);
+                if settings.has_apn() {
+                    return settings;
+                }
+                selected.fill_missing_from(settings);
+            }
+            Err(err) => {
+                warn!(path = %path, error = %err, "Failed to read ModemManager bearer properties for APN lookup");
+            }
+        }
+    }
+
+    selected
+}
+
+fn default_apn_for_operator_code(operator_code: &str) -> Option<&'static str> {
+    let digits: String = operator_code
+        .chars()
+        .filter(|ch| ch.is_ascii_digit())
+        .collect();
+    let normalized = if digits.starts_with("460") && digits.len() >= 5 {
+        &digits[..5]
+    } else {
+        digits.as_str()
+    };
+
+    match normalized {
+        "46000" | "46002" | "46004" | "46007" | "46008" => Some("cmnet"),
+        "46001" | "46006" | "46009" => Some("3gnet"),
+        "46003" | "46005" | "46011" => Some("ctnet"),
+        "46015" => Some("cbnet"),
+        _ => None,
+    }
+}
+
+async fn modem_operator_code(conn: &Connection, modem_path: &str) -> String {
+    let gpp_props = get_all_properties(conn, modem_path, MM_MODEM_3GPP)
+        .await
+        .unwrap_or_default();
+    let operator_code = gpp_props
+        .get("OperatorCode")
+        .map(extract_string)
+        .unwrap_or_default();
+    if !operator_code.trim().is_empty() {
+        return operator_code;
+    }
+
+    let Ok(sim_path) = get_sim_path(conn, modem_path).await else {
+        return String::new();
+    };
+    if sim_path.is_empty() || sim_path == "/" {
+        return String::new();
+    }
+    let sim_props = get_all_properties(conn, &sim_path, MM_SIM)
+        .await
+        .unwrap_or_default();
+    sim_props
+        .get("OperatorIdentifier")
+        .map(extract_string)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| {
+            let imsi = sim_props
+                .get("Imsi")
+                .map(extract_string)
+                .unwrap_or_default();
+            operator_code_from_imsi(&imsi)
+        })
+}
+
+async fn inferred_default_simple_connect_settings(
+    conn: &Connection,
+    modem_path: &str,
+) -> SimpleConnectSettings {
+    let operator_code = modem_operator_code(conn, modem_path).await;
+    let apn = default_apn_for_operator_code(&operator_code).map(str::to_string);
+    SimpleConnectSettings {
+        apn,
+        source: Some("operator-default"),
+        ..SimpleConnectSettings::default()
+    }
+}
+
+async fn resolve_simple_connect_settings(
+    conn: &Connection,
+    modem_path: &str,
+    configured_apn: Option<&ApnConfig>,
+) -> SimpleConnectSettings {
+    let mut settings = configured_apn
+        .map(apn_config_to_simple_connect_settings)
+        .unwrap_or_default();
+    if settings.has_apn() {
+        return settings;
+    }
+
+    settings.fill_missing_from(read_bearer_simple_connect_settings(conn, modem_path).await);
+    if settings.has_apn() {
+        return settings;
+    }
+
+    settings.fill_missing_from(inferred_default_simple_connect_settings(conn, modem_path).await);
+    settings
+}
+
+fn insert_simple_connect_settings<'a>(
+    props: &mut HashMap<String, Value<'a>>,
+    settings: &'a SimpleConnectSettings,
+) {
+    let Some(apn) = settings.apn.as_deref().filter(|apn| !apn.trim().is_empty()) else {
+        return;
+    };
+    props.insert("apn".to_string(), Value::new(apn.trim()));
+    if let Some(user) = settings
+        .user
+        .as_deref()
+        .filter(|user| !user.trim().is_empty())
+    {
+        props.insert("user".to_string(), Value::new(user.trim()));
+    }
+    if let Some(password) = settings
+        .password
+        .as_deref()
+        .filter(|password| !password.trim().is_empty())
+    {
+        props.insert("password".to_string(), Value::new(password));
+    }
+    if let Some(ip_type) = settings.ip_type {
+        props.insert("ip-type".to_string(), Value::new(ip_type));
+    }
+    if let Some(allowed_auth) = settings.allowed_auth {
+        props.insert("allowed-auth".to_string(), Value::new(allowed_auth));
+    }
+}
+
+pub async fn set_data_connection_with_apn(
     conn: &Connection,
     active: bool,
     allow_roaming: bool,
+    configured_apn: Option<&ApnConfig>,
+) -> zbus::Result<()> {
+    set_data_connection_inner(conn, active, allow_roaming, configured_apn).await
+}
+
+async fn set_data_connection_inner(
+    conn: &Connection,
+    active: bool,
+    allow_roaming: bool,
+    configured_apn: Option<&ApnConfig>,
 ) -> zbus::Result<()> {
     with_serial(async {
         let modem_path = find_modem_path(conn).await?;
@@ -2545,12 +3416,21 @@ pub async fn set_data_connection(
             }
 
             // 连接前清理残余 Bearer，防止历史 BUG 残留的 PDP Context 占用资源
+            let connect_settings =
+                resolve_simple_connect_settings(conn, &modem_path, configured_apn).await;
             disconnect_known_bearers(conn, &modem_path).await;
 
             let mut props: HashMap<String, Value<'_>> = HashMap::new();
             props.insert("allow-roaming".to_string(), Value::new(allow_roaming));
+            insert_simple_connect_settings(&mut props, &connect_settings);
             let bearer: OwnedObjectPath = proxy.call("Connect", &(props,)).await?;
-            info!(allow_roaming, bearer = %bearer, "Data connection activation requested");
+            info!(
+                allow_roaming,
+                apn = connect_settings.apn.as_deref().unwrap_or(""),
+                apn_source = connect_settings.source.unwrap_or("none"),
+                bearer = %bearer,
+                "Data connection activation requested"
+            );
         } else {
             let root_path = zbus::zvariant::ObjectPath::try_from("/").unwrap();
             if let Err(err) = proxy.call::<_, _, ()>("Disconnect", &(root_path,)).await {
@@ -2631,8 +3511,9 @@ pub async fn apply_roaming_policy(
         .set_roaming_allowed(allowed)
         .map_err(|e| zbus::fdo::Error::Failed(e))?;
     if get_data_connection_status(conn).await.unwrap_or(false) {
-        set_data_connection(conn, false, allowed).await?;
-        set_data_connection(conn, true, allowed).await?;
+        let apn_config = config.get_apn_config();
+        set_data_connection_with_apn(conn, false, allowed, Some(&apn_config)).await?;
+        set_data_connection_with_apn(conn, true, allowed, Some(&apn_config)).await?;
     }
     Ok(())
 }
@@ -2802,12 +3683,15 @@ async fn simple_connect_for_baseband_restart(
     conn: &Connection,
     modem_path: &str,
     allow_roaming: bool,
+    configured_apn: Option<&ApnConfig>,
 ) -> Result<String, String> {
     let proxy = Proxy::new(conn, MM_SERVICE, modem_path, MM_MODEM_SIMPLE)
         .await
         .map_err(|err| err.to_string())?;
+    let connect_settings = resolve_simple_connect_settings(conn, modem_path, configured_apn).await;
     let mut props: HashMap<String, Value<'_>> = HashMap::new();
     props.insert("allow-roaming".to_string(), Value::new(allow_roaming));
+    insert_simple_connect_settings(&mut props, &connect_settings);
     let bearer_path: OwnedObjectPath = proxy
         .call("Connect", &(props,))
         .await
@@ -2820,6 +3704,7 @@ async fn run_baseband_simple_connect_step(
     modem_path: &str,
     steps: &mut Vec<BasebandRestartStep>,
     allow_roaming: bool,
+    configured_apn: Option<&ApnConfig>,
 ) {
     if get_data_connection_status(conn).await.unwrap_or(false) {
         record_baseband_step(
@@ -2837,7 +3722,8 @@ async fn run_baseband_simple_connect_step(
         "running",
         Some("ModemManager Simple.Connect".to_string()),
     );
-    match simple_connect_for_baseband_restart(conn, modem_path, allow_roaming).await {
+    match simple_connect_for_baseband_restart(conn, modem_path, allow_roaming, configured_apn).await
+    {
         Ok(path) => record_baseband_step(steps, "触发自动驻网/拨号", "ok", Some(path)),
         Err(err) => record_baseband_step(
             steps,
@@ -3281,10 +4167,12 @@ fn extract_bearer_settings(props: &InterfaceProperties) -> InterfaceProperties {
         .unwrap_or_default()
 }
 
-pub async fn list_apn_contexts(conn: &Connection) -> zbus::Result<ApnListResponse> {
+pub async fn list_apn_contexts(
+    conn: &Connection,
+    configured_apn: Option<&ApnConfig>,
+) -> zbus::Result<ApnListResponse> {
     let modem_path = find_modem_path(conn).await?;
-    let bearer_paths =
-        extract_object_path_array(&get_property(conn, &modem_path, MM_MODEM, "Bearers").await?);
+    let bearer_paths = known_bearer_paths(conn, &modem_path).await?;
     let mut contexts = Vec::new();
     for path in bearer_paths {
         let props = get_all_properties(conn, &path, MM_BEARER).await?;
@@ -3329,16 +4217,47 @@ pub async fn list_apn_contexts(conn: &Connection) -> zbus::Result<ApnListRespons
             context_type: "internet".into(),
         });
     }
+    if let Some(config) = configured_apn.filter(|config| !config.apn.trim().is_empty()) {
+        for ctx in &mut contexts {
+            if ctx.apn.trim().is_empty() {
+                ctx.apn = config.apn.trim().to_string();
+                ctx.protocol = config.protocol.trim().to_string();
+                ctx.username = config.username.trim().to_string();
+                ctx.password = config.password.clone();
+                ctx.auth_method = config.auth_method.trim().to_string();
+            }
+        }
+    }
     if contexts.is_empty() {
+        let mut fallback = configured_apn
+            .map(apn_config_to_simple_connect_settings)
+            .unwrap_or_default();
+        if !fallback.has_apn() {
+            fallback.fill_missing_from(
+                inferred_default_simple_connect_settings(conn, &modem_path).await,
+            );
+        }
+        let configured_auth = configured_apn
+            .map(|config| config.auth_method.trim())
+            .filter(|auth| !auth.is_empty())
+            .unwrap_or("chap");
         contexts.push(ApnContext {
             path: format!("{modem_path}/bearer/default"),
             name: "default".into(),
             active: false,
-            apn: String::new(),
-            protocol: "dual".into(),
-            username: String::new(),
-            password: String::new(),
-            auth_method: "chap".into(),
+            apn: fallback.apn.unwrap_or_default(),
+            protocol: fallback
+                .ip_type
+                .map(bearer_ip_type_to_protocol)
+                .unwrap_or("dual")
+                .to_string(),
+            username: fallback.user.unwrap_or_default(),
+            password: fallback.password.unwrap_or_default(),
+            auth_method: fallback
+                .allowed_auth
+                .map(mm_allowed_auth_to_apn_auth_method)
+                .unwrap_or(configured_auth)
+                .to_string(),
             context_type: "internet".into(),
         });
     }
@@ -3621,6 +4540,25 @@ async fn run_direct_at_command(conn: &Connection, command: &str) -> Result<Strin
         .map_err(|err| format!("AT 命令任务失败：{err}"))?
 }
 
+/// 排空串口缓冲区后发送 AT 命令，使用较长超时。
+/// 解决部分 modem 响应缓慢或串口残留前次响应数据的问题。
+async fn run_direct_at_command_draining(
+    conn: &Connection,
+    command: &str,
+) -> Result<String, String> {
+    let device = at_command_device(conn).await?;
+    let command = command.to_string();
+    tokio::task::spawn_blocking(move || {
+        run_direct_at_command_draining_blocking(
+            &device,
+            &command,
+            SMSC_BACKGROUND_AT_TIMEOUT_SECS,
+        )
+    })
+    .await
+    .map_err(|err| format!("AT 命令任务失败：{err}"))?
+}
+
 #[cfg(unix)]
 fn run_direct_at_command_blocking(device: &str, command: &str) -> Result<String, String> {
     use std::io::{Read, Write};
@@ -3681,6 +4619,88 @@ fn run_direct_at_command_blocking(device: &str, command: &str) -> Result<String,
 
 #[cfg(not(unix))]
 fn run_direct_at_command_blocking(_device: &str, _command: &str) -> Result<String, String> {
+    Err("Direct AT port access is only supported on Linux devices".to_string())
+}
+
+#[cfg(unix)]
+fn run_direct_at_command_draining_blocking(
+    device: &str,
+    command: &str,
+    timeout_secs: u64,
+) -> Result<String, String> {
+    use std::io::{Read, Write};
+    use std::os::fd::AsRawFd;
+
+    let mut port = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(device)
+        .map_err(|err| format!("打开 AT 端口 {device} 失败：{err}"))?;
+
+    let fd = port.as_raw_fd();
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags >= 0 {
+            let _ = libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+    }
+
+    // 排空缓冲区中的残留数据
+    let mut drain_buf = [0u8; 512];
+    let drain_deadline = std::time::Instant::now() + Duration::from_millis(300);
+    while std::time::Instant::now() < drain_deadline {
+        match port.read(&mut drain_buf) {
+            Ok(0) => break,
+            Ok(_) => continue,
+            Err(_) => break,
+        }
+    }
+
+    port.write_all(format!("{command}\r").as_bytes())
+        .map_err(|err| format!("写入 AT 命令失败：{err}"))?;
+    port.flush()
+        .map_err(|err| format!("刷新 AT 端口失败：{err}"))?;
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
+    let mut output = Vec::new();
+    let mut buffer = [0u8; 512];
+    while std::time::Instant::now() < deadline {
+        match port.read(&mut buffer) {
+            Ok(0) => std::thread::sleep(Duration::from_millis(80)),
+            Ok(n) => {
+                output.extend_from_slice(&buffer[..n]);
+                let text = String::from_utf8_lossy(&output);
+                if text.contains("\r\nOK\r\n")
+                    || text.contains("\nOK\r")
+                    || text.contains("ERROR")
+                    || text.contains("NO CARRIER")
+                {
+                    break;
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(80));
+            }
+            Err(err) => return Err(format!("读取 AT 响应失败：{err}")),
+        }
+    }
+
+    let text = String::from_utf8_lossy(&output).trim().to_string();
+    if text.contains("ERROR") {
+        Err(text)
+    } else if text.is_empty() {
+        Err("AT 命令无响应".to_string())
+    } else {
+        Ok(text)
+    }
+}
+
+#[cfg(not(unix))]
+fn run_direct_at_command_draining_blocking(
+    _device: &str,
+    _command: &str,
+    _timeout_secs: u64,
+) -> Result<String, String> {
     Err("Direct AT port access is only supported on Linux devices".to_string())
 }
 
@@ -3926,9 +4946,17 @@ pub async fn init_data_connection(
     conn: &Connection,
     user_disabled: &AtomicBool,
     allow_roaming: bool,
+    configured_apn: Option<ApnConfig>,
 ) -> String {
     if user_disabled.load(Ordering::SeqCst) {
-        return match set_data_connection(conn, false, allow_roaming).await {
+        return match set_data_connection_with_apn(
+            conn,
+            false,
+            allow_roaming,
+            configured_apn.as_ref(),
+        )
+        .await
+        {
             Ok(_) => "Cellular data disabled by user, disconnected".to_string(),
             Err(err) => format!("Cellular data disabled by user; disconnect skipped: {err}"),
         };
@@ -3955,7 +4983,7 @@ pub async fn init_data_connection(
         return format!("Data connection transition in progress (state: {state_text}), waiting");
     }
 
-    match set_data_connection(conn, true, allow_roaming).await {
+    match set_data_connection_with_apn(conn, true, allow_roaming, configured_apn.as_ref()).await {
         Ok(_) => format!("Data connection activated (state was: {state_text})"),
         Err(err) => format!("Failed to activate data connection: {err}"),
     }
@@ -4003,6 +5031,32 @@ async fn run_recovery_command(program: &str, args: &[&str]) -> Result<String, St
         .args(args)
         .output()
         .await
+        .map_err(|err| format!("failed to spawn {program}: {err}"))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+
+    if output.status.success() {
+        if stdout.is_empty() {
+            Ok("ok".to_string())
+        } else {
+            Ok(stdout)
+        }
+    } else if stderr.is_empty() {
+        Err(format!("{program} exited with status {}", output.status))
+    } else {
+        Err(stderr)
+    }
+}
+
+async fn run_recovery_command_owned(
+    program: &str,
+    args: &[String],
+    timeout: Duration,
+) -> Result<String, String> {
+    let output = tokio::time::timeout(timeout, Command::new(program).args(args).output())
+        .await
+        .map_err(|_| format!("{program} timed out after {}s", timeout.as_secs()))?
         .map_err(|err| format!("failed to spawn {program}: {err}"))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -4080,17 +5134,237 @@ pub async fn restart_baseband(
     conn: &Connection,
     auto_connect_data: bool,
     allow_roaming: bool,
+    configured_apn: Option<ApnConfig>,
 ) -> Result<BasebandRestartResponse, String> {
     reset_baseband_restart_progress();
     let _progress_guard = BasebandRestartRunGuard;
-    with_serial(async move { restart_baseband_inner(conn, auto_connect_data, allow_roaming).await })
+    with_serial(async move {
+        restart_baseband_inner(
+            conn,
+            auto_connect_data,
+            allow_roaming,
+            configured_apn.as_ref(),
+        )
         .await
+    })
+    .await
+}
+
+pub async fn power_cycle_sim_for_profile_switch(
+    conn: &Connection,
+    auto_connect_data: bool,
+    allow_roaming: bool,
+    configured_apn: Option<ApnConfig>,
+) -> Result<BasebandRestartResponse, String> {
+    reset_baseband_restart_progress();
+    let _progress_guard = BasebandRestartRunGuard;
+    with_serial(async move {
+        power_cycle_sim_for_profile_switch_inner(
+            conn,
+            auto_connect_data,
+            allow_roaming,
+            configured_apn.as_ref(),
+        )
+        .await
+    })
+    .await
+}
+
+async fn power_cycle_sim_for_profile_switch_inner(
+    conn: &Connection,
+    auto_connect_data: bool,
+    allow_roaming: bool,
+    configured_apn: Option<&ApnConfig>,
+) -> Result<BasebandRestartResponse, String> {
+    let mut steps = Vec::new();
+    record_baseband_step(
+        &mut steps,
+        "开始刷新 eSIM Profile（SIM 断电重枚举）",
+        "running",
+        None,
+    );
+
+    let initial_qmi_device = match find_modem_path(conn).await {
+        Ok(modem_path) => {
+            record_baseband_step(&mut steps, "定位当前基带", "ok", Some(modem_path.clone()));
+            qmi_control_device(conn, &modem_path)
+                .await
+                .or_else(find_qmi_device_path)
+        }
+        Err(err) => {
+            record_baseband_step(
+                &mut steps,
+                "定位当前基带",
+                "warning",
+                Some(format!("D-Bus 暂不可用，改用设备节点兜底：{err}")),
+            );
+            find_qmi_device_path()
+        }
+    };
+
+    record_baseband_step(&mut steps, "停止 ModemManager", "running", None);
+    match run_recovery_command("systemctl", &["stop", "ModemManager"]).await {
+        Ok(output) => record_baseband_step(&mut steps, "停止 ModemManager", "ok", Some(output)),
+        Err(err) => record_baseband_step(
+            &mut steps,
+            "停止 ModemManager",
+            "warning",
+            Some(format!("停止失败，继续尝试 SIM 断电：{err}")),
+        ),
+    }
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let power_result: Result<(), String> = async {
+        let qmi_device =
+            wait_for_qmi_device_path(initial_qmi_device.as_deref(), Duration::from_secs(12))
+                .await
+                .ok_or_else(|| "未找到 QMI 设备节点，无法执行 SIM 断电上电".to_string())?;
+        record_baseband_step(&mut steps, "定位 QMI 设备", "ok", Some(qmi_device.clone()));
+
+        record_baseband_step(&mut steps, "SIM 断电", "running", None);
+        match qmicli_sim_power(&qmi_device, false).await {
+            Ok(output) => record_baseband_step(&mut steps, "SIM 断电", "ok", Some(output)),
+            Err(err) => {
+                record_baseband_step(&mut steps, "SIM 断电", "error", Some(err.clone()));
+                return Err(err);
+            }
+        }
+
+        record_baseband_step(
+            &mut steps,
+            "等待 SIM 断电完成",
+            "running",
+            Some("等待 3 秒".to_string()),
+        );
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        record_baseband_step(&mut steps, "等待 SIM 断电完成", "ok", None);
+
+        let qmi_device = wait_for_qmi_device_path(Some(&qmi_device), Duration::from_secs(12))
+            .await
+            .ok_or_else(|| "SIM 断电后未重新找到 QMI 设备节点".to_string())?;
+        record_baseband_step(&mut steps, "SIM 上电", "running", None);
+        match qmicli_sim_power(&qmi_device, true).await {
+            Ok(output) => record_baseband_step(&mut steps, "SIM 上电", "ok", Some(output)),
+            Err(err) => {
+                record_baseband_step(&mut steps, "SIM 上电", "error", Some(err.clone()));
+                return Err(err);
+            }
+        }
+
+        record_baseband_step(
+            &mut steps,
+            "等待 SIM 重新上电",
+            "running",
+            Some("等待 3 秒".to_string()),
+        );
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        record_baseband_step(&mut steps, "等待 SIM 重新上电", "ok", None);
+        Ok(())
+    }
+    .await;
+
+    record_baseband_step(&mut steps, "启动 ModemManager", "running", None);
+    let start_result = run_recovery_command("systemctl", &["start", "ModemManager"]).await;
+    match &start_result {
+        Ok(output) => {
+            record_baseband_step(&mut steps, "启动 ModemManager", "ok", Some(output.clone()))
+        }
+        Err(err) => {
+            record_baseband_step(&mut steps, "启动 ModemManager", "error", Some(err.clone()))
+        }
+    }
+
+    if let Err(err) = power_result {
+        return Err(err);
+    }
+    if let Err(err) = start_result {
+        return Err(format!("SIM 已重新上电，但 ModemManager 启动失败：{err}"));
+    }
+
+    record_baseband_step(
+        &mut steps,
+        "等待基带重新枚举",
+        "running",
+        Some("等待 10 秒".to_string()),
+    );
+    tokio::time::sleep(Duration::from_secs(10)).await;
+
+    let modem_path = match find_modem_path(conn).await {
+        Ok(path) => {
+            record_baseband_step(&mut steps, "等待基带重新枚举", "ok", Some(path.clone()));
+            path
+        }
+        Err(err) => {
+            let message = err.to_string();
+            record_baseband_step(
+                &mut steps,
+                "等待基带重新枚举",
+                "error",
+                Some(message.clone()),
+            );
+            return Err(message);
+        }
+    };
+
+    match wait_for_radio_search(conn, &modem_path, Duration::from_secs(60)).await {
+        Ok(state) => record_baseband_step(
+            &mut steps,
+            "等待射频搜索网络",
+            "ok",
+            Some(mm_state_to_string(state).to_string()),
+        ),
+        Err(err) => {
+            record_baseband_step(&mut steps, "等待射频搜索网络", "error", Some(err.clone()));
+            return Err(err);
+        }
+    }
+
+    if auto_connect_data {
+        run_baseband_simple_connect_step(
+            conn,
+            &modem_path,
+            &mut steps,
+            allow_roaming,
+            configured_apn,
+        )
+        .await;
+    } else {
+        record_baseband_step(
+            &mut steps,
+            "触发自动驻网/拨号",
+            "skipped",
+            Some("蜂窝数据已由用户关闭，仅等待 Modem 驻网".to_string()),
+        );
+    }
+
+    if let Err(err) =
+        wait_for_registered_network(conn, &modem_path, &mut steps, Duration::from_secs(60)).await
+    {
+        record_baseband_step(
+            &mut steps,
+            "等待网络注册",
+            "warning",
+            Some(format!("超时或注册异常：{err}")),
+        );
+    }
+
+    record_baseband_step(&mut steps, "eSIM Profile 刷新完成", "ok", None);
+    let current_registration = BASEBAND_RESTART_REGISTRATION
+        .lock()
+        .ok()
+        .and_then(|registration| registration.clone());
+    Ok(BasebandRestartResponse {
+        steps,
+        running: false,
+        current_registration,
+    })
 }
 
 async fn restart_baseband_inner(
     conn: &Connection,
     auto_connect_data: bool,
     allow_roaming: bool,
+    configured_apn: Option<&ApnConfig>,
 ) -> Result<BasebandRestartResponse, String> {
     let mut steps = Vec::new();
     record_baseband_step(&mut steps, "开始重启基带（软重启）", "running", None);
@@ -4159,7 +5433,14 @@ async fn restart_baseband_inner(
     }
 
     if auto_connect_data {
-        run_baseband_simple_connect_step(conn, &modem_path, &mut steps, allow_roaming).await;
+        run_baseband_simple_connect_step(
+            conn,
+            &modem_path,
+            &mut steps,
+            allow_roaming,
+            configured_apn,
+        )
+        .await;
     } else {
         record_baseband_step(
             &mut steps,
@@ -4386,7 +5667,15 @@ pub async fn data_connection_watchdog(
                         } else {
                             last_data_activation_attempt_at = Some(Instant::now());
                             let allow_roaming = config.get_roaming_allowed();
-                            match set_data_connection(&conn, true, allow_roaming).await {
+                            let apn_config = config.get_apn_config();
+                            match set_data_connection_with_apn(
+                                &conn,
+                                true,
+                                allow_roaming,
+                                Some(&apn_config),
+                            )
+                            .await
+                            {
                                 Ok(_) => "Connection activation requested".to_string(),
                                 Err(err) => format!("Activation failed: {err}"),
                             }

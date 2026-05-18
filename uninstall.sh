@@ -9,6 +9,7 @@ KEEP_USER_DATA="${KEEP_USER_DATA:-0}"
 MODEM_RECOVERY_SERVICE_NAME="${MODEM_RECOVERY_SERVICE_NAME:-simadmin-modem-recovery}"
 MODEM_RECOVERY_SCRIPT="${MODEM_RECOVERY_SCRIPT:-/usr/local/bin/simadmin-modem-recovery.sh}"
 NM_CONF="${NM_CONF:-/etc/NetworkManager/conf.d/99-simadmin-unmanaged-modem.conf}"
+MM_DEBUG_CONF="${MM_DEBUG_CONF:-/etc/systemd/system/ModemManager.service.d/99-simadmin-debug.conf}"
 OTA_STAGING_DIR="${OTA_STAGING_DIR:-/tmp/ota_staging}"
 DEVICE_CONFIG_PATH="${DEVICE_CONFIG_PATH:-/data/config.json}"
 
@@ -183,9 +184,21 @@ restart_networkmanager_if_active() {
   fi
 }
 
+restart_modemmanager_if_active() {
+  if ! command_exists systemctl; then
+    return 0
+  fi
+
+  if systemctl is-active --quiet ModemManager.service; then
+    echo "==> restarting ModemManager"
+    systemctl restart ModemManager.service || true
+  fi
+}
+
 remove_install_files_keep_data() {
   remove_path "${INSTALL_DIR}/simadmin"
   remove_path "${INSTALL_DIR}/www"
+  remove_path "${INSTALL_DIR}/lpac"
   remove_path "${INSTALL_DIR}/meta.json"
 
   if [ -d "$INSTALL_DIR" ]; then
@@ -230,6 +243,7 @@ main() {
 
   remove_path "$MODEM_RECOVERY_SCRIPT"
   remove_path "$NM_CONF"
+  remove_path "$MM_DEBUG_CONF"
   remove_path "$OTA_STAGING_DIR"
 
   if [ "$KEEP_USER_DATA" -eq 1 ]; then
@@ -239,6 +253,7 @@ main() {
   fi
 
   restart_networkmanager_if_active
+  restart_modemmanager_if_active
 
   echo "==> done"
 }

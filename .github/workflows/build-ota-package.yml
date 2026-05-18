@@ -13,6 +13,14 @@ on:
         required: false
         type: boolean
         default: true
+      release_type:
+        description: '发布类型（Release type）'
+        required: true
+        type: choice
+        default: '最新正式版（latest release）'
+        options:
+          - '最新正式版（latest release）'
+          - '预发布版（pre-release）'
 
 env:
   CARGO_TERM_COLOR: always
@@ -237,7 +245,7 @@ jobs:
           echo "📋 复制前端文件..."
           mkdir -p "$OTA_TMP/www"
           cp -r "$FRONTEND_DIR"/* "$OTA_TMP/www/"
-          
+
           # 计算前端 MD5 (Linux)
           echo "📋 计算前端 MD5..."
           FRONTEND_MD5=$(find "$OTA_TMP/www" -type f -exec md5sum {} \; | cut -d' ' -f1 | sort | md5sum | cut -d' ' -f1)
@@ -263,13 +271,11 @@ jobs:
           mkdir -p release
           
           # 打包
-          OTA_FILE="release/simadmin_${VERSION}.tar.gz"
-          LATEST_OTA_FILE="release/simadmin_latest.tar.gz"
+          OTA_FILE="release/simadmin.tar.gz"
           echo "📦 打包 OTA 更新包..."
           cd "$OTA_TMP"
           tar -czf "$GITHUB_WORKSPACE/$OTA_FILE" meta.json simadmin www
           cd "$GITHUB_WORKSPACE"
-          cp "$OTA_FILE" "$LATEST_OTA_FILE"
           
           # 显示结果
           echo ""
@@ -279,21 +285,22 @@ jobs:
           echo ""
           echo "📍 输出文件: $OTA_FILE"
           ls -lh "$OTA_FILE"
-          ls -lh "$LATEST_OTA_FILE"
           echo ""
           echo "📋 包内容:"
           tar -tzf "$OTA_FILE" | head -20
           echo ""
           
-          # 计算包的 MD5
+          # 计算包的 MD5 和 SHA-256
           OTA_MD5=$(md5sum "$OTA_FILE" | cut -d' ' -f1)
+          OTA_SHA256=$(sha256sum "$OTA_FILE" | cut -d' ' -f1)
           echo "📝 OTA 包 MD5: $OTA_MD5"
+          echo "📝 OTA 包 SHA-256: $OTA_SHA256"
           echo ""
           
           # 保存到输出
           echo "ota_file=$OTA_FILE" >> $GITHUB_OUTPUT
-          echo "latest_ota_file=$LATEST_OTA_FILE" >> $GITHUB_OUTPUT
           echo "ota_md5=$OTA_MD5" >> $GITHUB_OUTPUT
+          echo "ota_sha256=$OTA_SHA256" >> $GITHUB_OUTPUT
           echo "build_time=$BUILD_TIME" >> $GITHUB_OUTPUT
         id: package
       
@@ -304,35 +311,35 @@ jobs:
           tag_name: v${{ steps.version.outputs.version }}
           name: SimAdmin_v${{ steps.version.outputs.version }}
           files: |
-            release/simadmin_${{ steps.version.outputs.version }}.tar.gz
-            release/simadmin_latest.tar.gz
+            release/simadmin.tar.gz
           overwrite_files: true
           generate_release_notes: true
           body: |
             ## OTA 更新包
             
             ### 版本信息
-
+            
             - **版本**: ${{ steps.version.outputs.version }}
             - **Commit**: ${{ github.sha }}
             - **构建时间**: ${{ steps.package.outputs.build_time }}
-            - **文件名**: `simadmin_${{ steps.version.outputs.version }}.tar.gz`
-            - **latest 安装别名**: `simadmin_latest.tar.gz`
+            - **发布类型**: ${{ inputs.release_type }}
+            - **文件名**: `simadmin.tar.gz`
             - **MD5**: `${{ steps.package.outputs.ota_md5 }}`
+            - **SHA-256**: `${{ steps.package.outputs.ota_sha256 }}`
             
             ### 安装说明
             
             ```bash
             # 上传 OTA 包到设备
             curl -X POST http://IP:3000/api/ota/upload \
-              -F "file=@simadmin_${{ steps.version.outputs.version }}.tar.gz"
+              -F "file=@simadmin.tar.gz"
             
             # 开始 OTA 更新
             curl -X POST http://IP:3000/api/ota/apply
             ```
           draft: false
-          prerelease: false
-          make_latest: true
+          prerelease: ${{ inputs.release_type == '预发布版（pre-release）' }}
+          make_latest: ${{ inputs.release_type == '最新正式版（latest release）' }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       
@@ -346,11 +353,12 @@ jobs:
           echo "| VERSION 文件版本 | ${{ steps.version.outputs.current_version }} |" >> $GITHUB_STEP_SUMMARY
           echo "| 版本 | ${{ steps.version.outputs.version }} |" >> $GITHUB_STEP_SUMMARY
           echo "| 版本来源 | ${{ steps.version.outputs.version_source }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 发布类型 | ${{ inputs.release_type }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Commit | ${{ github.sha }} |" >> $GITHUB_STEP_SUMMARY
           echo "| 架构 | aarch64-unknown-linux-musl |" >> $GITHUB_STEP_SUMMARY
           echo "| UPX 压缩 | ${{ inputs.use_upx }} |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### 📦 产物" >> $GITHUB_STEP_SUMMARY
           echo "- \`${{ steps.package.outputs.ota_file }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- \`${{ steps.package.outputs.latest_ota_file }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- MD5: \`${{ steps.package.outputs.ota_md5 }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- SHA-256: \`${{ steps.package.outputs.ota_sha256 }}\`" >> $GITHUB_STEP_SUMMARY

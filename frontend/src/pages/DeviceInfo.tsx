@@ -186,7 +186,7 @@ export default function DeviceInfoPage() {
                     <TableRow>
                       <TableCell component="th">短信中心号码</TableCell>
                       <TableCell sx={{ fontFamily: 'monospace', ...getSensitiveStyle(showSimInfo) }}>
-                        {simInfo?.sms_center || 'N/A'}
+                        {simInfo?.sms_center || '未读取到'}
                       </TableCell>
                     </TableRow>
                   </TableBody>

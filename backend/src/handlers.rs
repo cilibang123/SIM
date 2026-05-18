@@ -17,17 +17,20 @@ use tracing::{error, info, warn};
 use zbus::Connection;
 
 use crate::{
+    config::ApnConfig,
+    esim::EsimApiError,
     models::*,
     modem_manager::{
-        answer_call, apply_roaming_policy, get_airplane_mode, get_band_lock_status,
-        get_baseband_restart_progress, get_call_by_path, get_call_settings, get_cell_location,
-        get_cells_data, get_data_connection_status, get_device_info_data, get_is_roaming_mm,
-        get_network_info_data, get_operators_list, get_radio_mode, get_signal_strength,
-        get_sim_info_data_with_cache, hangup_all_calls, hangup_call, list_apn_contexts,
-        list_current_calls, make_call, register_operator_auto, register_operator_manual,
-        restart_baseband, scan_operators, send_sms, set_airplane_mode, set_apn_on_bearer,
-        set_band_lock, set_call_waiting, set_data_connection, set_radio_mode,
-        start_cell_monitoring, stop_cell_monitoring,
+        answer_call, apply_roaming_policy, current_sim_identity, get_airplane_mode,
+        get_band_lock_status, get_baseband_restart_progress, get_call_by_path, get_call_settings,
+        get_cell_location, get_cells_data, get_data_connection_status, get_device_info_data,
+        get_is_roaming_mm, get_network_info_data, get_operators_list, get_radio_mode,
+        get_signal_strength, get_sim_info_data_with_cache, hangup_all_calls, hangup_call,
+        list_apn_contexts, list_current_calls, make_call, power_cycle_sim_for_profile_switch,
+        register_operator_auto, register_operator_manual, restart_baseband, scan_operators,
+        send_sms, set_airplane_mode, set_apn_on_bearer, set_band_lock, set_call_waiting,
+        set_data_connection_with_apn, set_radio_mode, start_cell_monitoring,
+        stop_cell_monitoring, background_fetch_smsc,
     },
     state::AppState,
     utils::{
@@ -36,6 +39,11 @@ use crate::{
         read_uptime, sample_cpu_usage,
     },
 };
+
+const ESIM_SIM_IDENTITY_TIMEOUT_SECS: u64 = 3;
+const ESIM_SIM_ENRICH_TIMEOUT_SECS: u64 = 12;
+const SMS_DB_MAINTENANCE_DELETE_THRESHOLD: usize = 100;
+const SMS_DB_MAINTENANCE_DELAY_SECS: u64 = 60;
 
 // ============ 基础接口 ============
 
@@ -55,6 +63,477 @@ pub async fn health_check() -> impl IntoResponse {
             "version": env!("CARGO_PKG_VERSION"),
         })),
     )
+}
+
+fn esim_error_response<T: Default>(error: EsimApiError) -> (StatusCode, Json<ApiResponse<T>>) {
+    let status = match error {
+        EsimApiError::Disabled => StatusCode::FORBIDDEN,
+        EsimApiError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+        EsimApiError::Command(_) => StatusCode::OK,
+    };
+    (status, Json(ApiResponse::<T>::error(error.message())))
+}
+
+fn esim_command_succeeded(response: &EsimCommandResponse) -> bool {
+    response.code == 0
+        && (response.status.is_empty()
+            || response.status.eq_ignore_ascii_case("success")
+            || response.status.eq_ignore_ascii_case("ok"))
+}
+
+fn esim_profile_is_active(profile: &EsimProfile) -> bool {
+    matches!(
+        profile.state.trim().to_ascii_lowercase().as_str(),
+        "enabled" | "active" | "1" | "true"
+    )
+}
+
+fn enrich_profiles_with_current_sim(profiles: &mut [EsimProfile], sim: &SimInfoResponse) {
+    if !sim.present {
+        return;
+    }
+    let current_index = profiles
+        .iter()
+        .position(|profile| !sim.iccid.is_empty() && profile.iccid == sim.iccid)
+        .or_else(|| profiles.iter().position(esim_profile_is_active));
+
+    let Some(profile) = current_index.and_then(|index| profiles.get_mut(index)) else {
+        return;
+    };
+
+    if profile.state == "unknown" || !sim.iccid.is_empty() && profile.iccid == sim.iccid {
+        profile.state = "enabled".to_string();
+    }
+    if profile.imsi.is_none() && !sim.imsi.is_empty() {
+        profile.imsi = Some(sim.imsi.clone());
+    }
+    if profile.msisdn.is_none() {
+        if let Some(number) = sim
+            .phone_numbers
+            .iter()
+            .find(|number| !number.trim().is_empty())
+        {
+            profile.msisdn = Some(number.clone());
+        }
+    }
+    if profile.smsc.is_none() && !sim.sms_center.is_empty() {
+        profile.smsc = Some(sim.sms_center.clone());
+    }
+    if profile.mcc.is_none() && !sim.mcc.is_empty() {
+        profile.mcc = Some(sim.mcc.clone());
+    }
+    if profile.mnc.is_none() && !sim.mnc.is_empty() {
+        profile.mnc = Some(sim.mnc.clone());
+    }
+}
+
+fn split_profile_operator_code(code: &str) -> (String, String) {
+    let digits: String = code.chars().filter(|ch| ch.is_ascii_digit()).collect();
+    if digits.len() >= 6 {
+        (digits[..3].to_string(), digits[3..6].to_string())
+    } else if digits.len() >= 5 {
+        (digits[..3].to_string(), digits[3..].to_string())
+    } else {
+        (String::new(), String::new())
+    }
+}
+
+fn enrich_profiles_with_current_identity(
+    profiles: &mut [EsimProfile],
+    identity: &crate::modem_manager::SimIdentity,
+) {
+    let current_index = profiles
+        .iter()
+        .position(|profile| !identity.iccid.is_empty() && profile.iccid == identity.iccid)
+        .or_else(|| profiles.iter().position(esim_profile_is_active));
+
+    let Some(profile) = current_index.and_then(|index| profiles.get_mut(index)) else {
+        return;
+    };
+
+    if profile.state == "unknown" || !identity.iccid.is_empty() && profile.iccid == identity.iccid {
+        profile.state = "enabled".to_string();
+    }
+    if profile.imsi.is_none() && !identity.imsi.is_empty() {
+        profile.imsi = Some(identity.imsi.clone());
+    }
+    let (mcc, mnc) = split_profile_operator_code(&identity.operator_id);
+    if profile.mcc.is_none() && !mcc.is_empty() {
+        profile.mcc = Some(mcc);
+    }
+    if profile.mnc.is_none() && !mnc.is_empty() {
+        profile.mnc = Some(mnc);
+    }
+}
+
+fn profile_cache_value(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+fn optional_profile_cache_value(value: &Option<String>) -> Option<String> {
+    value.as_deref().and_then(profile_cache_value)
+}
+
+fn profile_cache_entry(profile: &EsimProfile) -> EsimProfileCacheEntry {
+    EsimProfileCacheEntry {
+        iccid: profile.iccid.trim().to_string(),
+        name: profile_cache_value(&profile.name),
+        provider: profile_cache_value(&profile.provider),
+        profile_class: profile_cache_value(&profile.profile_class),
+        imsi: optional_profile_cache_value(&profile.imsi),
+        msisdn: optional_profile_cache_value(&profile.msisdn),
+        smsc: optional_profile_cache_value(&profile.smsc),
+        smdp: optional_profile_cache_value(&profile.smdp),
+        isdp_aid: optional_profile_cache_value(&profile.isdp_aid),
+        mcc: optional_profile_cache_value(&profile.mcc),
+        mnc: optional_profile_cache_value(&profile.mnc),
+        updated_at: String::new(),
+    }
+}
+
+fn fill_cached_string(target: &mut String, cached: Option<String>) {
+    if target.trim().is_empty() {
+        if let Some(value) = cached.and_then(|item| profile_cache_value(&item)) {
+            *target = value;
+        }
+    }
+}
+
+fn fill_cached_option(target: &mut Option<String>, cached: Option<String>) {
+    if target.as_deref().unwrap_or("").trim().is_empty() {
+        if let Some(value) = cached.and_then(|item| profile_cache_value(&item)) {
+            *target = Some(value);
+        }
+    }
+}
+
+fn hydrate_profile_from_cache(db: &Database, profile: &mut EsimProfile) {
+    let cache = match db.get_esim_profile_cache(&profile.iccid) {
+        Ok(Some(cache)) => cache,
+        Ok(None) => return,
+        Err(err) => {
+            warn!(iccid = %profile.iccid, error = %err, "Failed to read eSIM profile cache");
+            return;
+        }
+    };
+
+    fill_cached_string(&mut profile.name, cache.name);
+    fill_cached_string(&mut profile.provider, cache.provider);
+    fill_cached_string(&mut profile.profile_class, cache.profile_class);
+    fill_cached_option(&mut profile.imsi, cache.imsi);
+    fill_cached_option(&mut profile.msisdn, cache.msisdn);
+    fill_cached_option(&mut profile.smsc, cache.smsc);
+    fill_cached_option(&mut profile.smdp, cache.smdp);
+    fill_cached_option(&mut profile.isdp_aid, cache.isdp_aid);
+    fill_cached_option(&mut profile.mcc, cache.mcc);
+    fill_cached_option(&mut profile.mnc, cache.mnc);
+}
+
+fn hydrate_profiles_from_cache(db: &Database, profiles: &mut [EsimProfile]) {
+    for profile in profiles {
+        hydrate_profile_from_cache(db, profile);
+    }
+}
+
+fn cache_esim_profiles(db: &Database, profiles: &[EsimProfile]) {
+    for profile in profiles {
+        if let Err(err) = db.upsert_esim_profile_cache(&profile_cache_entry(profile)) {
+            warn!(iccid = %profile.iccid, error = %err, "Failed to write eSIM profile cache");
+        }
+    }
+}
+
+fn profile_from_cache_entry(entry: EsimProfileCacheEntry) -> EsimProfile {
+    EsimProfile {
+        iccid: entry.iccid,
+        name: entry.name.unwrap_or_default(),
+        provider: entry.provider.unwrap_or_default(),
+        state: "unknown".to_string(),
+        profile_class: entry.profile_class.unwrap_or_default(),
+        imsi: entry.imsi,
+        msisdn: entry.msisdn,
+        smsc: entry.smsc,
+        smdp: entry.smdp,
+        isdp_aid: entry.isdp_aid,
+        mcc: entry.mcc,
+        mnc: entry.mnc,
+        disable_allowed: Some(true),
+        delete_allowed: Some(true),
+        raw: json!({
+            "source": "cache",
+            "updated_at": entry.updated_at,
+        }),
+    }
+}
+
+fn cached_profiles_requested(query: &std::collections::HashMap<String, String>) -> bool {
+    query
+        .get("cached")
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes"
+            )
+        })
+        .unwrap_or(false)
+}
+
+// ============ 工作模式 / eSIM ============
+
+/// GET /api/work-mode
+pub async fn get_work_mode_handler(State(app): State<AppState>) -> impl IntoResponse {
+    let mode = app.config_manager.get_work_mode();
+    let worker_running = app.esim_supervisor.worker_running().await;
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success_with_message(
+            "Success",
+            WorkModeResponse {
+                mode,
+                worker_running,
+            },
+        )),
+    )
+}
+
+/// POST /api/work-mode
+pub async fn set_work_mode_handler(
+    State(app): State<AppState>,
+    Json(payload): Json<WorkModeRequest>,
+) -> impl IntoResponse {
+    if !payload.confirm {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<WorkModeResponse>::error(
+                "Changing work mode requires confirm=true",
+            )),
+        );
+    }
+
+    match app.esim_supervisor.switch_mode(payload.mode).await {
+        Ok(data) => (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message("Work mode updated", data)),
+        ),
+        Err(err) => (
+            StatusCode::OK,
+            Json(ApiResponse::<WorkModeResponse>::error(err)),
+        ),
+    }
+}
+
+/// GET /api/esim/lpac/status
+pub async fn get_esim_lpac_status_handler(State(app): State<AppState>) -> impl IntoResponse {
+    match app.esim_supervisor.get_lpac_status().await {
+        Ok(data) => (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message("Success", data)),
+        ),
+        Err(err) => esim_error_response::<EsimLpacStatusResponse>(err),
+    }
+}
+
+/// POST /api/esim/lpac/repair
+pub async fn repair_esim_lpac_handler(
+    State(app): State<AppState>,
+    Json(payload): Json<EsimLpacRepairRequest>,
+) -> impl IntoResponse {
+    match app.esim_supervisor.repair_lpac(payload).await {
+        Ok(data) => (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message("lpac repaired", data)),
+        ),
+        Err(err) => esim_error_response::<EsimLpacRepairResponse>(err),
+    }
+}
+
+/// GET /api/esim/euicc
+pub async fn get_esim_euicc_handler(State(app): State<AppState>) -> impl IntoResponse {
+    match app.esim_supervisor.get_euicc_info().await {
+        Ok(data) => (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message("Success", data)),
+        ),
+        Err(err) => esim_error_response::<EsimEuiccInfo>(err),
+    }
+}
+
+/// GET /api/esim/profiles
+pub async fn get_esim_profiles_handler(
+    State(app): State<AppState>,
+    Query(query): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    if cached_profiles_requested(&query) {
+        return match app.database.list_esim_profile_cache() {
+            Ok(entries) => (
+                StatusCode::OK,
+                Json(ApiResponse::success_with_message(
+                    "Cached profiles",
+                    EsimProfilesResponse {
+                        profiles: entries.into_iter().map(profile_from_cache_entry).collect(),
+                    },
+                )),
+            ),
+            Err(err) => (
+                StatusCode::OK,
+                Json(ApiResponse::<EsimProfilesResponse>::error(format!(
+                    "Failed to read cached profiles: {err}"
+                ))),
+            ),
+        };
+    }
+
+    match app.esim_supervisor.get_profiles().await {
+        Ok(mut data) => {
+            hydrate_profiles_from_cache(&app.database, &mut data.profiles);
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(ESIM_SIM_IDENTITY_TIMEOUT_SECS),
+                current_sim_identity(&app.dbus_conn),
+            )
+            .await
+            {
+                Ok(Some(identity)) => {
+                    enrich_profiles_with_current_identity(&mut data.profiles, &identity)
+                }
+                Ok(None) => {}
+                Err(_) => warn!(
+                    timeout_secs = ESIM_SIM_IDENTITY_TIMEOUT_SECS,
+                    "Timed out enriching eSIM profiles with current SIM identity"
+                ),
+            }
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(ESIM_SIM_ENRICH_TIMEOUT_SECS),
+                get_sim_info_data_with_cache(&app.dbus_conn, Some(&app.database)),
+            )
+            .await
+            {
+                Ok(Ok(sim_info)) => enrich_profiles_with_current_sim(&mut data.profiles, &sim_info),
+                Ok(Err(err)) => {
+                    warn!(error = %err, "Failed to enrich eSIM profiles with current SIM")
+                }
+                Err(_) => warn!(
+                    timeout_secs = ESIM_SIM_ENRICH_TIMEOUT_SECS,
+                    "Timed out enriching eSIM profiles with current SIM"
+                ),
+            }
+            cache_esim_profiles(&app.database, &data.profiles);
+            (
+                StatusCode::OK,
+                Json(ApiResponse::success_with_message("Success", data)),
+            )
+        }
+        Err(err) => esim_error_response::<EsimProfilesResponse>(err),
+    }
+}
+
+/// POST /api/esim/profiles/{iccid}/enable
+pub async fn enable_esim_profile_handler(
+    State(app): State<AppState>,
+    Path(iccid): Path<String>,
+) -> impl IntoResponse {
+    match app.esim_supervisor.enable_profile(iccid).await {
+        Ok(mut data) => {
+            if esim_command_succeeded(&data) {
+                let auto_connect_data = !app.data_user_disabled.load(Ordering::SeqCst);
+                let allow_roaming = app.config_manager.get_roaming_allowed();
+                let apn_config = app.config_manager.get_apn_config();
+                match power_cycle_sim_for_profile_switch(
+                    &app.dbus_conn,
+                    auto_connect_data,
+                    allow_roaming,
+                    Some(apn_config),
+                )
+                .await
+                {
+                    Ok(recovery) => {
+                        let lpac_data = data.data.take();
+                        data.msg =
+                            "Profile enabled and modem SIM power-cycle completed".to_string();
+                        data.data = Some(json!({
+                            "lpac_data": lpac_data,
+                            "baseband_restart": recovery,
+                        }));
+                        if app.sms_resync.request_scan("profile-switch") {
+                            info!("Requested SMS resync after eSIM profile switch");
+                        } else {
+                            warn!("Failed to request SMS resync after eSIM profile switch");
+                        }
+                    }
+                    Err(err) => {
+                        data.code = 1;
+                        data.status = "error".to_string();
+                        data.msg = format!(
+                            "Profile enable command succeeded, but modem SIM power-cycle failed: {err}"
+                        );
+                        if app
+                            .sms_resync
+                            .request_scan("profile-switch-recovery-failed")
+                        {
+                            info!("Requested SMS resync after failed eSIM profile recovery");
+                        } else {
+                            warn!(
+                                "Failed to request SMS resync after failed eSIM profile recovery"
+                            );
+                        }
+                    }
+                }
+            }
+            (
+                StatusCode::OK,
+                Json(ApiResponse::success_with_message(
+                    "Profile enable requested",
+                    data,
+                )),
+            )
+        }
+        Err(err) => esim_error_response::<EsimCommandResponse>(err),
+    }
+}
+
+/// POST /api/esim/profiles/{iccid}/rename
+pub async fn rename_esim_profile_handler(
+    State(app): State<AppState>,
+    Path(iccid): Path<String>,
+    Json(payload): Json<EsimRenameRequest>,
+) -> impl IntoResponse {
+    let name = payload.name.trim().to_string();
+    if name.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<EsimCommandResponse>::error(
+                "Profile name cannot be empty",
+            )),
+        );
+    }
+    match app.esim_supervisor.rename_profile(iccid, name).await {
+        Ok(data) => (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message("Profile renamed", data)),
+        ),
+        Err(err) => esim_error_response::<EsimCommandResponse>(err),
+    }
+}
+
+/// DELETE /api/esim/profiles/{iccid}
+pub async fn delete_esim_profile_handler(
+    State(app): State<AppState>,
+    Path(iccid): Path<String>,
+) -> impl IntoResponse {
+    match app.esim_supervisor.delete_profile(iccid.clone()).await {
+        Ok(data) => {
+            if esim_command_succeeded(&data) {
+                if let Err(err) = app.database.delete_esim_profile_cache(&iccid) {
+                    warn!(iccid = %iccid, error = %err, "Failed to delete eSIM profile cache");
+                }
+            }
+            (
+                StatusCode::OK,
+                Json(ApiResponse::success_with_message("Profile deleted", data)),
+            )
+        }
+        Err(err) => esim_error_response::<EsimCommandResponse>(err),
+    }
 }
 
 // ============ 设备信息 ============
@@ -83,10 +562,20 @@ pub async fn get_sim_info(
     State((conn, db)): State<(Arc<Connection>, Arc<Database>)>,
 ) -> impl IntoResponse {
     match get_sim_info_data_with_cache(&conn, Some(&db)).await {
-        Ok(data) => (
-            StatusCode::OK,
-            Json(ApiResponse::success_with_message("Success", data)),
-        ),
+        Ok(data) => {
+            // 如果 SMSC 为空，后台异步通过 AT+CRSM 读取 EF_SMSP 并缓存
+            if data.sms_center.is_empty() {
+                let conn_bg = Arc::clone(&conn);
+                let db_bg = Arc::clone(&db);
+                tokio::spawn(async move {
+                    background_fetch_smsc(&conn_bg, &db_bg).await;
+                });
+            }
+            (
+                StatusCode::OK,
+                Json(ApiResponse::success_with_message("Success", data)),
+            )
+        }
         Err(e) => (
             StatusCode::OK,
             Json(ApiResponse::<SimInfoResponse>::error(format!(
@@ -371,8 +860,9 @@ pub async fn register_network_auto(State(conn): State<Arc<Connection>>) -> impl 
 }
 
 /// GET /api/apn
-pub async fn get_apn_list_handler(State(conn): State<Arc<Connection>>) -> impl IntoResponse {
-    match list_apn_contexts(&conn).await {
+pub async fn get_apn_list_handler(State(app): State<AppState>) -> impl IntoResponse {
+    let apn_config = app.config_manager.get_apn_config();
+    match list_apn_contexts(&app.dbus_conn, Some(&apn_config)).await {
         Ok(data) => (
             StatusCode::OK,
             Json(ApiResponse::success_with_message("Success", data)),
@@ -389,21 +879,68 @@ pub async fn get_apn_list_handler(State(conn): State<Arc<Connection>>) -> impl I
 
 /// POST /api/apn
 pub async fn set_apn_handler(
-    State(conn): State<Arc<Connection>>,
+    State(app): State<AppState>,
     Json(payload): Json<SetApnRequest>,
 ) -> impl IntoResponse {
-    match set_apn_on_bearer(&conn, &payload).await {
+    let mut apn_config = app.config_manager.get_apn_config();
+    if let Some(apn) = &payload.apn {
+        apn_config.apn = apn.trim().to_string();
+    }
+    if let Some(protocol) = &payload.protocol {
+        apn_config.protocol = protocol.trim().to_string();
+    }
+    if let Some(username) = &payload.username {
+        apn_config.username = username.trim().to_string();
+    }
+    if let Some(password) = &payload.password {
+        apn_config.password = password.clone();
+    }
+    if let Some(auth_method) = &payload.auth_method {
+        apn_config.auth_method = auth_method.trim().to_string();
+    }
+    if apn_config.protocol.trim().is_empty() {
+        apn_config.protocol = ApnConfig::default().protocol;
+    }
+    if apn_config.auth_method.trim().is_empty() {
+        apn_config.auth_method = ApnConfig::default().auth_method;
+    }
+
+    if let Err(err) = app.config_manager.set_apn_config(apn_config) {
+        return (
+            StatusCode::OK,
+            Json(ApiResponse::<serde_json::Value>::error(format!(
+                "Failed to save APN config: {}",
+                err
+            ))),
+        );
+    }
+
+    let context_path = payload.context_path.trim();
+    if context_path.is_empty() || context_path.ends_with("/bearer/default") {
+        return (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message(
+                "APN config saved",
+                json!({}),
+            )),
+        );
+    }
+
+    match set_apn_on_bearer(&app.dbus_conn, &payload).await {
         Ok(()) => (
             StatusCode::OK,
             Json(ApiResponse::success_with_message("APN updated", json!({}))),
         ),
-        Err(e) => (
-            StatusCode::OK,
-            Json(ApiResponse::<serde_json::Value>::error(format!(
-                "Failed: {}",
-                e
-            ))),
-        ),
+        Err(e) => {
+            warn!(error = %e, "APN config saved but bearer update failed");
+            (
+                StatusCode::OK,
+                Json(ApiResponse::success_with_message(
+                    "APN config saved",
+                    json!({ "bearer_update_error": e.to_string() }),
+                )),
+            )
+        }
     }
 }
 
@@ -822,7 +1359,15 @@ pub async fn set_data_status(
     Json(payload): Json<DataConnectionRequest>,
 ) -> impl IntoResponse {
     let allow_roaming = app.config_manager.get_roaming_allowed();
-    match set_data_connection(&app.dbus_conn, payload.active, allow_roaming).await {
+    let apn_config = app.config_manager.get_apn_config();
+    match set_data_connection_with_apn(
+        &app.dbus_conn,
+        payload.active,
+        allow_roaming,
+        Some(&apn_config),
+    )
+    .await
+    {
         Ok(_) => {
             if let Err(err) = app.config_manager.set_data_enabled(payload.active) {
                 return (
@@ -858,7 +1403,15 @@ pub async fn set_data_status(
 pub async fn restart_baseband_handler(State(app): State<AppState>) -> impl IntoResponse {
     let auto_connect_data = !app.data_user_disabled.load(Ordering::SeqCst);
     let allow_roaming = app.config_manager.get_roaming_allowed();
-    match restart_baseband(&app.dbus_conn, auto_connect_data, allow_roaming).await {
+    let apn_config = app.config_manager.get_apn_config();
+    match restart_baseband(
+        &app.dbus_conn,
+        auto_connect_data,
+        allow_roaming,
+        Some(apn_config),
+    )
+    .await
+    {
         Ok(data) => (
             StatusCode::OK,
             Json(ApiResponse::success_with_message(
@@ -1011,7 +1564,44 @@ pub async fn get_airplane_mode_handler(State(conn): State<Arc<Connection>>) -> i
 
 // ============ 短信功能 ============
 
-use crate::db::Database;
+use crate::db::{Database, EsimProfileCacheEntry};
+
+fn schedule_sms_db_maintenance(app: &AppState, deleted: usize) {
+    if deleted < SMS_DB_MAINTENANCE_DELETE_THRESHOLD {
+        return;
+    }
+
+    if app.sms_db_maintenance_pending.swap(true, Ordering::SeqCst) {
+        info!(
+            deleted,
+            threshold = SMS_DB_MAINTENANCE_DELETE_THRESHOLD,
+            "SMS database maintenance already scheduled"
+        );
+        return;
+    }
+
+    let db = Arc::clone(&app.database);
+    let pending = Arc::clone(&app.sms_db_maintenance_pending);
+    tokio::spawn(async move {
+        info!(
+            deleted,
+            delay_secs = SMS_DB_MAINTENANCE_DELAY_SECS,
+            "SMS database maintenance scheduled"
+        );
+        tokio::time::sleep(tokio::time::Duration::from_secs(
+            SMS_DB_MAINTENANCE_DELAY_SECS,
+        ))
+        .await;
+
+        let result = tokio::task::spawn_blocking(move || db.vacuum()).await;
+        match result {
+            Ok(Ok(())) => info!("SMS database maintenance completed"),
+            Ok(Err(err)) => warn!(error = %err, "SMS database maintenance failed"),
+            Err(err) => warn!(error = %err, "SMS database maintenance task failed"),
+        }
+        pending.store(false, Ordering::SeqCst);
+    });
+}
 
 /// POST /api/sms/send
 pub async fn send_sms_handler(
@@ -1122,16 +1712,25 @@ pub async fn get_sms_stats_handler(
 
 /// POST /api/sms/clear
 pub async fn clear_sms_handler(
-    State(db): State<Arc<Database>>,
+    State(app): State<AppState>,
 ) -> (StatusCode, Json<ApiResponse<serde_json::Value>>) {
-    match db.clear_all_sms() {
-        Ok(_) => (
-            StatusCode::OK,
-            Json(ApiResponse::success_with_message(
-                "All SMS cleared",
-                json!({}),
-            )),
-        ),
+    let deleted = app
+        .database
+        .get_sms_stats()
+        .map(|stats| stats.total.max(0) as usize)
+        .unwrap_or(SMS_DB_MAINTENANCE_DELETE_THRESHOLD);
+
+    match app.database.clear_all_sms() {
+        Ok(_) => {
+            schedule_sms_db_maintenance(&app, deleted);
+            (
+                StatusCode::OK,
+                Json(ApiResponse::success_with_message(
+                    "All SMS cleared",
+                    json!({ "deleted": deleted }),
+                )),
+            )
+        }
         Err(e) => (
             StatusCode::OK,
             Json(ApiResponse::error(format!("Failed: {}", e))),
@@ -1161,17 +1760,20 @@ pub async fn delete_sms_message_handler(
 
 /// DELETE /api/sms/conversation/{phone_number}
 pub async fn delete_sms_conversation_handler(
-    State(db): State<Arc<Database>>,
+    State(app): State<AppState>,
     Path(phone_number): Path<String>,
 ) -> (StatusCode, Json<ApiResponse<serde_json::Value>>) {
-    match db.delete_sms_conversation(&phone_number) {
-        Ok(deleted) => (
-            StatusCode::OK,
-            Json(ApiResponse::success_with_message(
-                "SMS conversation deleted",
-                json!({ "deleted": deleted }),
-            )),
-        ),
+    match app.database.delete_sms_conversation(&phone_number) {
+        Ok(deleted) => {
+            schedule_sms_db_maintenance(&app, deleted);
+            (
+                StatusCode::OK,
+                Json(ApiResponse::success_with_message(
+                    "SMS conversation deleted",
+                    json!({ "deleted": deleted }),
+                )),
+            )
+        }
         Err(e) => (
             StatusCode::OK,
             Json(ApiResponse::error(format!("Failed: {}", e))),
@@ -1181,21 +1783,27 @@ pub async fn delete_sms_conversation_handler(
 
 /// POST /api/sms/batch-delete
 pub async fn delete_sms_batch_handler(
-    State(db): State<Arc<Database>>,
+    State(app): State<AppState>,
     Json(payload): Json<SmsBatchDeleteRequest>,
 ) -> (StatusCode, Json<ApiResponse<serde_json::Value>>) {
     if payload.ids.is_empty() && payload.phone_numbers.is_empty() {
         return (StatusCode::OK, Json(ApiResponse::error("No SMS selected")));
     }
 
-    match db.delete_sms_batch(&payload.ids, &payload.phone_numbers) {
-        Ok(deleted) => (
-            StatusCode::OK,
-            Json(ApiResponse::success_with_message(
-                "SMS batch deleted",
-                json!({ "deleted": deleted }),
-            )),
-        ),
+    match app
+        .database
+        .delete_sms_batch(&payload.ids, &payload.phone_numbers)
+    {
+        Ok(deleted) => {
+            schedule_sms_db_maintenance(&app, deleted);
+            (
+                StatusCode::OK,
+                Json(ApiResponse::success_with_message(
+                    "SMS batch deleted",
+                    json!({ "deleted": deleted }),
+                )),
+            )
+        }
         Err(e) => (
             StatusCode::OK,
             Json(ApiResponse::error(format!("Failed: {}", e))),
@@ -2188,5 +2796,48 @@ pub async fn cancel_ota_handler() -> impl IntoResponse {
                 e
             ))),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::modem_manager::SimIdentity;
+
+    #[test]
+    fn enriches_enabled_esim_profile_from_current_sim_identity() {
+        let mut profiles = vec![
+            EsimProfile {
+                iccid: "profile-a".to_string(),
+                state: "disabled".to_string(),
+                ..Default::default()
+            },
+            EsimProfile {
+                iccid: "profile-b".to_string(),
+                state: "disabled".to_string(),
+                ..Default::default()
+            },
+        ];
+        let identity = SimIdentity {
+            iccid: "profile-b".to_string(),
+            imsi: "234336".to_string(),
+            operator_id: "234336".to_string(),
+        };
+
+        enrich_profiles_with_current_identity(&mut profiles, &identity);
+
+        assert_eq!(profiles[1].state, "enabled");
+        assert_eq!(profiles[1].imsi.as_deref(), Some("234336"));
+        assert_eq!(profiles[1].mcc.as_deref(), Some("234"));
+        assert_eq!(profiles[1].mnc.as_deref(), Some("336"));
+        assert!(profiles[0].mcc.is_none());
+    }
+
+    #[test]
+    fn splits_five_digit_operator_codes_for_profile_enrichment() {
+        assert_eq!(
+            split_profile_operator_code("46002"),
+            ("460".to_string(), "02".to_string())
+        );
     }
 }

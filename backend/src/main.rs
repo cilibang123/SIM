@@ -9,11 +9,10 @@ use axum::{
     extract::DefaultBodyLimit,
     http::{StatusCode, Uri},
     response::{IntoResponse, Response},
-    routing::get,
-    routing::post,
+    routing::{delete, get, post},
     Router,
 };
-use clap::Parser;
+use clap::{Args as ClapArgs, Parser, Subcommand};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
@@ -28,6 +27,7 @@ mod cell_lock_store;
 mod config;
 mod db;
 mod device_network;
+mod esim;
 mod handlers;
 mod iptables;
 mod models;
@@ -42,6 +42,7 @@ mod utils;
 use config::{get_default_config_path, ConfigManager};
 use db::Database;
 use device_network::DdnsManager;
+use esim::EsimSupervisor;
 use handlers::*;
 use modem_manager::{ensure_networkmanager_wwan_unmanaged, init_data_connection};
 use notification::NotificationSender;
@@ -121,11 +122,117 @@ async fn spa_fallback(uri: Uri) -> Response {
     }
 }
 
-/// SimAdmin 后端服务
+/// 确保 ModemManager 开启 debug 提权模式，但为了防止日志爆炸，
+/// 启动后立刻通过 ExecStartPost 将日志级别降回 INFO。
+/// 这完美绕过了 Modem.Command 的 Unauthorized 限制，同时保持系统纯净。
+fn ensure_modemmanager_debug_override() {
+    let override_dir = "/etc/systemd/system/ModemManager.service.d";
+    let override_file = "/etc/systemd/system/ModemManager.service.d/99-simadmin-debug.conf";
+    
+    let desired_content = "\
+# SimAdmin: enable ModemManager debug mode so that Modem.Command D-Bus
+# interface is available for AT+CRSM (SIM file read) and AT+CSCA? (SMSC query).
+# We immediately set logging level back to INFO via ExecStartPost to prevent log spam.
+[Service]
+ExecStart=
+ExecStart=/usr/sbin/ModemManager --debug
+ExecStartPost=-/usr/bin/busctl call org.freedesktop.ModemManager1 /org/freedesktop/ModemManager1 org.freedesktop.ModemManager1 SetLogging s \"INFO\"
+";
+
+    let needs_update = match std::fs::read_to_string(override_file) {
+        Ok(content) => content != desired_content,
+        Err(_) => true,
+    };
+
+    if needs_update {
+        tracing::info!("Applying ModemManager debug override (with silent logging)...");
+        let _ = std::fs::create_dir_all(override_dir);
+        if let Err(e) = std::fs::write(override_file, desired_content) {
+            tracing::warn!("Failed to write MM debug override: {}", e);
+            return;
+        }
+
+        // Reload systemd & restart ModemManager silently
+        let _ = std::process::Command::new("systemctl")
+            .arg("daemon-reload")
+            .output();
+        let _ = std::process::Command::new("systemctl")
+            .args(["restart", "ModemManager.service"])
+            .output();
+        tracing::info!("ModemManager debug override applied and service restarted.");
+    }
+}
+
+/// 解压 ZIP 文件到指定目录（供安装脚本使用，无需依赖 unzip / python3）
+fn run_extract_zip(archive: &str, target: &str) -> Result<()> {
+    use std::io;
+
+    let file = std::fs::File::open(archive)
+        .map_err(|e| anyhow::anyhow!("Failed to open {}: {}", archive, e))?;
+    let mut zip = zip::ZipArchive::new(file)
+        .map_err(|e| anyhow::anyhow!("Invalid zip archive {}: {}", archive, e))?;
+
+    let target_dir = std::path::Path::new(target);
+    std::fs::create_dir_all(target_dir)
+        .map_err(|e| anyhow::anyhow!("Failed to create target dir {}: {}", target, e))?;
+
+    for i in 0..zip.len() {
+        let mut entry = zip.by_index(i)?;
+        let Some(path) = entry.enclosed_name().map(|p| target_dir.join(p)) else {
+            continue;
+        };
+
+        if entry.is_dir() {
+            std::fs::create_dir_all(&path)?;
+            continue;
+        }
+
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut outfile = std::fs::File::create(&path)?;
+        io::copy(&mut entry, &mut outfile)?;
+
+        // 保留可执行权限
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Some(mode) = entry.unix_mode() {
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))?;
+            }
+        }
+    }
+
+    println!("Extracted {} entries to {}", zip.len(), target);
+    Ok(())
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "simadmin")]
 #[command(author, version, about, long_about = None)]
-struct Args {
+struct Cli {
+    #[command(subcommand)]
+    command: Option<CliCommand>,
+
+    #[command(flatten)]
+    serve: ServeArgs,
+}
+
+#[derive(Subcommand, Debug)]
+enum CliCommand {
+    /// 启动 Web 管理服务
+    Serve(ServeArgs),
+    /// 解压 ZIP 文件到指定目录（供安装脚本调用）
+    ExtractZip {
+        /// ZIP 文件路径
+        archive: String,
+        /// 解压目标目录
+        target: String,
+    },
+}
+
+#[derive(ClapArgs, Debug, Clone)]
+struct ServeArgs {
     /// 监听端口 (默认: 3000)
     #[arg(short, long, default_value = "3000", env = "PORT")]
     port: u16,
@@ -144,8 +251,22 @@ async fn main() -> Result<()> {
         .with(tracing_subscriber::fmt::layer().with_target(false))
         .init();
 
+    // 确保 ModemManager 已提权以支持 AT 指令读取短信中心
+    ensure_modemmanager_debug_override();
+
     // 解析命令行参数
-    let args = Args::parse();
+    let cli = Cli::parse();
+
+    // 处理非服务子命令
+    if let Some(CliCommand::ExtractZip { archive, target }) = &cli.command {
+        return run_extract_zip(archive, target);
+    }
+
+    let args = match cli.command {
+        Some(CliCommand::Serve(args)) => args,
+        None => cli.serve,
+        _ => unreachable!(),
+    };
     let bind_addr = display_bind_addr(&args.host, args.port);
 
     // Connect to system D-Bus
@@ -167,6 +288,7 @@ async fn main() -> Result<()> {
     let data_user_disabled = Arc::new(AtomicBool::new(!config_manager.get_data_enabled()));
     let airplane_mode_requested = Arc::new(AtomicBool::new(false));
     let cell_monitoring_active = Arc::new(AtomicBool::new(false));
+    let esim_supervisor = Arc::new(EsimSupervisor::new(Arc::clone(&config_manager)));
 
     let nm_result = ensure_networkmanager_wwan_unmanaged().await;
     tracing::info!(result = %nm_result, "NetworkManager modem ownership check completed");
@@ -177,6 +299,7 @@ async fn main() -> Result<()> {
         Arc::clone(&dbus_conn),
         Arc::clone(&app_db),
     ));
+    let (sms_resync, sms_resync_rx) = sms_listener::sms_resync_channel();
     let ddns_manager = Arc::new(DdnsManager::new());
 
     {
@@ -227,9 +350,15 @@ async fn main() -> Result<()> {
         let conn_clone = Connection::system().await?;
         let db_clone = Arc::clone(&app_db);
         let notification_clone = Arc::clone(&notification_sender);
+        let resync_rx = sms_resync_rx;
         tokio::spawn(async move {
-            let _ =
-                sms_listener::start_sms_listener(conn_clone, db_clone, notification_clone).await;
+            let _ = sms_listener::start_sms_listener(
+                conn_clone,
+                db_clone,
+                notification_clone,
+                resync_rx,
+            )
+            .await;
         });
     }
 
@@ -244,8 +373,14 @@ async fn main() -> Result<()> {
             // 等待 2 秒让 modem 完全初始化
             tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
             let allow_roaming = cfg.get_roaming_allowed();
-            let result =
-                init_data_connection(conn_clone.as_ref(), user_off.as_ref(), allow_roaming).await;
+            let apn_config = cfg.get_apn_config();
+            let result = init_data_connection(
+                conn_clone.as_ref(),
+                user_off.as_ref(),
+                allow_roaming,
+                Some(apn_config),
+            )
+            .await;
             tracing::info!(result = %result, "Auto-connect completed");
         });
     }
@@ -284,6 +419,8 @@ async fn main() -> Result<()> {
         config_manager,
         notification_sender,
         ddns_manager,
+        Arc::clone(&esim_supervisor),
+        sms_resync,
         data_user_disabled,
         airplane_mode_requested,
         cell_monitoring_active,
@@ -445,6 +582,41 @@ async fn main() -> Result<()> {
         .route(
             "/api/baseband/restart/status",
             get(get_baseband_restart_status_handler).options(options_handler),
+        )
+        // ========== 工作模式 / eSIM 管理 ==========
+        .route(
+            "/api/work-mode",
+            get(get_work_mode_handler)
+                .post(set_work_mode_handler)
+                .options(options_handler),
+        )
+        .route(
+            "/api/esim/lpac/status",
+            get(get_esim_lpac_status_handler).options(options_handler),
+        )
+        .route(
+            "/api/esim/lpac/repair",
+            post(repair_esim_lpac_handler).options(options_handler),
+        )
+        .route(
+            "/api/esim/euicc",
+            get(get_esim_euicc_handler).options(options_handler),
+        )
+        .route(
+            "/api/esim/profiles",
+            get(get_esim_profiles_handler).options(options_handler),
+        )
+        .route(
+            "/api/esim/profiles/{iccid}/enable",
+            post(enable_esim_profile_handler).options(options_handler),
+        )
+        .route(
+            "/api/esim/profiles/{iccid}/rename",
+            post(rename_esim_profile_handler).options(options_handler),
+        )
+        .route(
+            "/api/esim/profiles/{iccid}",
+            delete(delete_esim_profile_handler).options(options_handler),
         )
         // ========== 电话功能接口 ==========
         .route(

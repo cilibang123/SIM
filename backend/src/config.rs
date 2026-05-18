@@ -9,6 +9,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use tracing::{info, warn};
 
+use crate::models::WorkMode;
+
 /// Webhook 配置
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WebhookConfig {
@@ -653,6 +655,58 @@ fn default_data_enabled() -> bool {
     false
 }
 
+fn default_apn_protocol() -> String {
+    "dual".to_string()
+}
+
+fn default_apn_auth_method() -> String {
+    "chap".to_string()
+}
+
+fn default_lpac_path() -> String {
+    "/opt/simadmin/lpac/lpac".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApnConfig {
+    #[serde(default)]
+    pub apn: String,
+    #[serde(default = "default_apn_protocol")]
+    pub protocol: String,
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub password: String,
+    #[serde(default = "default_apn_auth_method")]
+    pub auth_method: String,
+}
+
+impl Default for ApnConfig {
+    fn default() -> Self {
+        Self {
+            apn: String::new(),
+            protocol: default_apn_protocol(),
+            username: String::new(),
+            password: String::new(),
+            auth_method: default_apn_auth_method(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EsimConfig {
+    #[serde(default = "default_lpac_path")]
+    pub lpac_path: String,
+}
+
+impl Default for EsimConfig {
+    fn default() -> Self {
+        Self {
+            lpac_path: default_lpac_path(),
+        }
+    }
+}
+
 /// 应用配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -669,6 +723,12 @@ pub struct AppConfig {
     pub roaming_allowed: bool,
     #[serde(default = "default_data_enabled")]
     pub data_enabled: bool,
+    #[serde(default)]
+    pub apn: ApnConfig,
+    #[serde(default)]
+    pub work_mode: WorkMode,
+    #[serde(default)]
+    pub esim: EsimConfig,
 }
 
 impl Default for AppConfig {
@@ -680,6 +740,9 @@ impl Default for AppConfig {
             version_update_notifications: VersionUpdateNotificationConfig::default(),
             roaming_allowed: default_roaming_allowed(),
             data_enabled: default_data_enabled(),
+            apn: ApnConfig::default(),
+            work_mode: WorkMode::default(),
+            esim: EsimConfig::default(),
         }
     }
 }
@@ -749,6 +812,18 @@ impl ConfigManager {
         self.config.read().unwrap().data_enabled
     }
 
+    pub fn get_apn_config(&self) -> ApnConfig {
+        self.config.read().unwrap().apn.clone()
+    }
+
+    pub fn get_work_mode(&self) -> WorkMode {
+        self.config.read().unwrap().work_mode
+    }
+
+    pub fn get_esim_config(&self) -> EsimConfig {
+        self.config.read().unwrap().esim.clone()
+    }
+
     pub fn get_device_network(&self) -> DeviceNetworkConfig {
         self.config.read().unwrap().device_network.clone()
     }
@@ -769,6 +844,22 @@ impl ConfigManager {
         {
             let mut c = self.config.write().unwrap();
             c.data_enabled = enabled;
+        }
+        self.save()
+    }
+
+    pub fn set_apn_config(&self, apn: ApnConfig) -> Result<(), String> {
+        {
+            let mut c = self.config.write().unwrap();
+            c.apn = apn;
+        }
+        self.save()
+    }
+
+    pub fn set_work_mode(&self, mode: WorkMode) -> Result<(), String> {
+        {
+            let mut c = self.config.write().unwrap();
+            c.work_mode = mode;
         }
         self.save()
     }

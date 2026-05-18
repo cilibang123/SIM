@@ -13,7 +13,14 @@ SERVICE_URL="${SERVICE_URL:-${RAW_BASE}/main/scripts/simadmin.service}"
 MODEM_RECOVERY_SCRIPT_URL="${MODEM_RECOVERY_SCRIPT_URL:-${RAW_BASE}/main/scripts/simadmin-modem-recovery.sh}"
 MODEM_RECOVERY_SERVICE_URL="${MODEM_RECOVERY_SERVICE_URL:-${RAW_BASE}/main/scripts/simadmin-modem-recovery.service}"
 ASSET_URL="${ASSET_URL:-}"
-ASSET_NAME="${ASSET_NAME:-simadmin_latest.tar.gz}"
+ASSET_NAME="${ASSET_NAME:-simadmin.tar.gz}"
+SIMADMIN_INSTALL_LPAC="${SIMADMIN_INSTALL_LPAC:-1}"
+LPAC_RELEASE_BASE_URL="${LPAC_RELEASE_BASE_URL:-https://github.com/estkme-group/lpac/releases/latest/download}"
+LPAC_COMPAT_RELEASE_BASE_URL="${LPAC_COMPAT_RELEASE_BASE_URL:-https://github.com/3899/SimAdmin/releases/download/lpac}"
+LPAC_TARGET_ARCH="${LPAC_TARGET_ARCH:-}"
+LPAC_ASSET_FLAVOR="${LPAC_ASSET_FLAVOR:-compat}"
+LPAC_ASSET_NAME="${LPAC_ASSET_NAME:-}"
+LPAC_ASSET_URL="${LPAC_ASSET_URL:-}"
 
 require_root() {
   if [ "$(id -u)" -ne 0 ]; then
@@ -27,6 +34,13 @@ require_cmd() {
     echo "error: missing required command: $1" >&2
     exit 1
   fi
+}
+
+truthy() {
+  case "$1" in
+    1|true|TRUE|yes|YES|y|Y|on|ON) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 download_with_proxies() {
@@ -87,8 +101,7 @@ version_to_tag() {
 
 asset_url_from_tag() {
   tag="$1"
-  asset_version="${tag#v}"
-  printf 'https://github.com/%s/releases/download/%s/simadmin_%s.tar.gz\n' "$REPO" "$tag" "$asset_version"
+  printf 'https://github.com/%s/releases/download/%s/simadmin.tar.gz\n' "$REPO" "$tag"
 }
 
 repo_version() {
@@ -186,6 +199,248 @@ configure_networkmanager_modem_unmanaged() {
   fi
 }
 
+normalize_lpac_arch() {
+  case "$1" in
+    aarch64|arm64)
+      printf '%s\n' "aarch64"
+      ;;
+    x86_64|amd64)
+      printf '%s\n' "x86_64"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+detect_lpac_arch() {
+  if [ -n "$LPAC_TARGET_ARCH" ]; then
+    normalize_lpac_arch "$LPAC_TARGET_ARCH"
+    return $?
+  fi
+
+  normalize_lpac_arch "$(uname -m)"
+}
+
+detect_glibc_version() {
+  if command -v getconf >/dev/null 2>&1; then
+    version="$(getconf GNU_LIBC_VERSION 2>/dev/null | awk '{print $2}' || true)"
+    if [ -n "$version" ]; then
+      printf '%s\n' "$version"
+      return 0
+    fi
+  fi
+
+  if command -v ldd >/dev/null 2>&1; then
+    version="$(ldd --version 2>/dev/null | head -n 1 | sed -E 's/.* ([0-9]+\.[0-9]+).*/\1/' || true)"
+    if [ -n "$version" ]; then
+      printf '%s\n' "$version"
+      return 0
+    fi
+  fi
+
+  printf '%s\n' ""
+}
+
+version_le() {
+  [ "$1" = "$2" ] && return 0
+  [ -n "$1" ] || return 0
+  [ -n "$2" ] || return 1
+  first="$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n 1)"
+  [ "$first" = "$1" ]
+}
+
+resolve_lpac_asset_name() {
+  arch="$1"
+
+  if [ -n "$LPAC_ASSET_NAME" ]; then
+    printf '%s\n' "$LPAC_ASSET_NAME"
+    return 0
+  fi
+
+  case "$LPAC_ASSET_FLAVOR" in
+    compat)
+      glibc_version="$(detect_glibc_version)"
+      if [ "$arch" = "aarch64" ] && version_le "2.31" "$glibc_version"; then
+        printf 'lpac-linux-aarch64-glibc2.31.zip\n'
+      else
+        printf 'lpac-linux-%s.zip\n' "$arch"
+      fi
+      ;;
+    ""|default)
+      printf 'lpac-linux-%s.zip\n' "$arch"
+      ;;
+    with-qmi)
+      printf 'lpac-linux-%s-with-qmi.zip\n' "$arch"
+      ;;
+    without-lto)
+      printf 'lpac-linux-%s-without-lto.zip\n' "$arch"
+      ;;
+    *)
+      echo "warning: unsupported LPAC_ASSET_FLAVOR=${LPAC_ASSET_FLAVOR}, skipping lpac install" >&2
+      return 1
+      ;;
+  esac
+}
+
+resolve_lpac_asset_url() {
+  if [ -n "$LPAC_ASSET_URL" ]; then
+    printf '%s\n' "$LPAC_ASSET_URL"
+    return 0
+  fi
+
+  arch="$(detect_lpac_arch)" || return 1
+  asset_name="$(resolve_lpac_asset_name "$arch")" || return 1
+  if [ "$LPAC_ASSET_FLAVOR" = "compat" ] && [ "$asset_name" = "lpac-linux-aarch64-glibc2.31.zip" ]; then
+    printf '%s/%s\n' "$LPAC_COMPAT_RELEASE_BASE_URL" "$asset_name"
+    return 0
+  fi
+  printf '%s/%s\n' "$LPAC_RELEASE_BASE_URL" "$asset_name"
+}
+
+extract_lpac_archive() {
+  archive="$1"
+  target="$2"
+
+  mkdir -p "$target"
+  if command -v unzip >/dev/null 2>&1; then
+    unzip -oq "$archive" -d "$target"
+    return $?
+  fi
+
+  if command -v busybox >/dev/null 2>&1; then
+    busybox unzip -oq "$archive" -d "$target"
+    return $?
+  fi
+
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$archive" "$target" <<'PY'
+import sys
+from zipfile import ZipFile
+
+archive, target = sys.argv[1], sys.argv[2]
+ZipFile(archive).extractall(target)
+PY
+    return $?
+  fi
+
+  # 使用 simadmin 自带的 zip 解压能力（无需任何外部依赖）
+  if [ -x "${INSTALL_DIR}/simadmin" ]; then
+    echo "    using simadmin extract-zip (built-in)"
+    "${INSTALL_DIR}/simadmin" extract-zip "$archive" "$target"
+    return $?
+  fi
+
+  echo "warning: no zip extractor available, skipping lpac install" >&2
+  return 1
+}
+
+copy_lpac_tree() {
+  extract_dir="$1"
+  lpac_dst="$2"
+  asset_url="$3"
+
+  if [ -f "${extract_dir}/lpac" ]; then
+    bundle_root="${extract_dir}"
+  elif [ -f "${extract_dir}/executables/lpac" ]; then
+    bundle_root="${extract_dir}/executables"
+  else
+    bundle_root="$(find "$extract_dir" -type f -name lpac -exec dirname {} \; | head -n 1 || true)"
+  fi
+
+  if [ -z "$bundle_root" ] || [ ! -f "${bundle_root}/lpac" ]; then
+    echo "warning: downloaded lpac asset does not contain lpac executable" >&2
+    return 1
+  fi
+
+  rm -rf "${lpac_dst}"
+  mkdir -p "${lpac_dst}"
+  cp -R "${bundle_root}/." "${lpac_dst}/"
+
+  if [ -d "${extract_dir}/lib" ] && [ ! -d "${lpac_dst}/lib" ]; then
+    mkdir -p "${lpac_dst}/lib"
+    cp -R "${extract_dir}/lib/." "${lpac_dst}/lib/"
+  fi
+
+  if [ -d "${extract_dir}/libraries" ] && [ ! -d "${lpac_dst}/lib" ]; then
+    mkdir -p "${lpac_dst}/lib"
+    cp -R "${extract_dir}/libraries/." "${lpac_dst}/lib/"
+  fi
+
+  chmod -R a+rX "${lpac_dst}"
+  chmod 0755 "${lpac_dst}/lpac"
+
+  cat > "${lpac_dst}/SOURCE.txt" <<EOF
+lpac is installed from:
+${asset_url}
+
+Project:
+https://github.com/estkme-group/lpac
+EOF
+}
+
+lpac_binary_usable() {
+  lpac_home="$1"
+  if [ ! -x "${lpac_home}/lpac" ]; then
+    return 1
+  fi
+
+  output=$(LD_LIBRARY_PATH="${lpac_home}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" "${lpac_home}/lpac" 2>&1 || true)
+  case "$output" in
+    *GLIBC_*|*No\ such\ file\ or\ directory*)
+      return 1
+      ;;
+  esac
+
+  return 0
+}
+
+install_lpac() {
+  lpac_dst="${INSTALL_DIR}/lpac"
+  lpac_archive="${tmp_dir}/lpac.zip"
+  lpac_extract="${tmp_dir}/lpac-extract"
+
+  if ! truthy "$SIMADMIN_INSTALL_LPAC"; then
+    echo "==> skipping lpac install (SIMADMIN_INSTALL_LPAC=${SIMADMIN_INSTALL_LPAC})"
+    return 0
+  fi
+
+  lpac_arch="$(detect_lpac_arch || true)"
+  if [ -z "$lpac_arch" ]; then
+    echo "warning: unsupported device arch for lpac: $(uname -m), skipping lpac install" >&2
+    return 0
+  fi
+
+  lpac_url="$(resolve_lpac_asset_url || true)"
+  if [ -z "$lpac_url" ]; then
+    echo "warning: failed to resolve lpac asset, skipping lpac install" >&2
+    return 0
+  fi
+
+  echo "==> installing lpac for ${lpac_arch}"
+  if ! download_with_proxies "$lpac_url" "$lpac_archive"; then
+    echo "warning: failed to download lpac, keeping existing lpac if present" >&2
+    return 0
+  fi
+
+  if ! extract_lpac_archive "$lpac_archive" "$lpac_extract"; then
+    echo "warning: failed to extract lpac, keeping existing lpac if present" >&2
+    return 0
+  fi
+
+  if copy_lpac_tree "$lpac_extract" "$lpac_dst" "$lpac_url"; then
+    if lpac_binary_usable "$lpac_dst"; then
+      echo "==> lpac installed to ${lpac_dst}"
+    else
+      echo "warning: lpac was installed but may not be executable on this device; check glibc/architecture compatibility" >&2
+    fi
+  else
+    echo "warning: failed to install lpac, keeping existing lpac if present" >&2
+  fi
+}
+
+
+
 main() {
   require_root
   require_cmd curl
@@ -238,10 +493,13 @@ main() {
     install -m 0644 "${tmp_dir}/pkg/meta.json" "${INSTALL_DIR}/meta.json"
   fi
 
+  install_lpac
+
   echo "==> installing systemd unit"
   install_service_file
   echo "==> installing modem recovery service"
   install_modem_recovery_service
+
   configure_networkmanager_modem_unmanaged
 
   echo "==> starting service"

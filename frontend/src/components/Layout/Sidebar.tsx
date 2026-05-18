@@ -1,3 +1,4 @@
+import { useMemo } from 'react'
 import { useNavigate, useLocation } from 'react-router-dom'
 import {
   Box,
@@ -22,7 +23,9 @@ import {
   GitHub as GitHubIcon,
   SystemUpdateAlt as OtaIcon,
   Router as RouterIcon,
+  SimCard as EsimIcon,
 } from '@mui/icons-material'
+import { useWorkMode } from '../../contexts/WorkModeContext'
 
 const SIDEBAR_TRANSITION = '300ms cubic-bezier(0.4, 0, 0.2, 1)'
 
@@ -35,7 +38,7 @@ interface SidebarProps {
   isMobile: boolean
 }
 
-const menuItems = [
+const baseMenuItems = [
   { path: '/', label: '仪表盘', icon: DashboardIcon },
   { path: '/device', label: '设备信息', icon: DevicesIcon },
   { path: '/network', label: '蜂窝网络', icon: SignalIcon },
@@ -57,6 +60,16 @@ export default function Sidebar({
 }: SidebarProps) {
   const navigate = useNavigate()
   const location = useLocation()
+  const { mode } = useWorkMode()
+  const menuItems = useMemo(() => {
+    if (mode !== 'esim') return baseMenuItems
+    return [
+      baseMenuItems[0],
+      baseMenuItems[1],
+      { path: '/esim', label: 'eSIM 管理', icon: EsimIcon },
+      ...baseMenuItems.slice(2),
+    ]
+  }, [mode])
 
   const handleNavigation = (path: string): void => {
     void navigate(path)

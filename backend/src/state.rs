@@ -13,7 +13,9 @@ use crate::cell_lock_store::CellLockStore;
 use crate::config::ConfigManager;
 use crate::db::Database;
 use crate::device_network::DdnsManager;
+use crate::esim::EsimSupervisor;
 use crate::notification::NotificationSender;
+use crate::sms_listener::SmsResyncHandle;
 
 #[derive(Clone)]
 pub struct ActiveCallRecord {
@@ -36,6 +38,9 @@ pub struct AppState {
     /// 通知发送器（用于转发 SMS、通话和 DDNS 通知）
     pub notification_sender: Arc<NotificationSender>,
     pub ddns_manager: Arc<DdnsManager>,
+    pub esim_supervisor: Arc<EsimSupervisor>,
+    pub sms_resync: SmsResyncHandle,
+    pub sms_db_maintenance_pending: Arc<AtomicBool>,
     pub active_calls: Arc<Mutex<HashMap<String, ActiveCallRecord>>>,
     /// 小区锁定 UI 状态（底层无锁网时仅内存态）
     pub cell_lock: Arc<Mutex<CellLockStore>>,
@@ -54,6 +59,8 @@ impl AppState {
         config_manager: Arc<ConfigManager>,
         notification_sender: Arc<NotificationSender>,
         ddns_manager: Arc<DdnsManager>,
+        esim_supervisor: Arc<EsimSupervisor>,
+        sms_resync: SmsResyncHandle,
         data_user_disabled: Arc<AtomicBool>,
         airplane_mode_requested: Arc<AtomicBool>,
         cell_monitoring_active: Arc<AtomicBool>,
@@ -64,6 +71,9 @@ impl AppState {
             config_manager,
             notification_sender,
             ddns_manager,
+            esim_supervisor,
+            sms_resync,
+            sms_db_maintenance_pending: Arc::new(AtomicBool::new(false)),
             active_calls: Arc::new(Mutex::new(HashMap::new())),
             cell_lock: Arc::new(Mutex::new(CellLockStore::default())),
             data_user_disabled,
@@ -103,6 +113,12 @@ impl FromRef<AppState> for Arc<NotificationSender> {
 impl FromRef<AppState> for Arc<DdnsManager> {
     fn from_ref(state: &AppState) -> Self {
         state.ddns_manager.clone()
+    }
+}
+
+impl FromRef<AppState> for Arc<EsimSupervisor> {
+    fn from_ref(state: &AppState) -> Self {
+        state.esim_supervisor.clone()
     }
 }
 

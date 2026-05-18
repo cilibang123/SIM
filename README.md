@@ -104,7 +104,8 @@ SimAdmin 是一套面向 Debian 蜂窝 CPE、随身 WiFi、软路由类设备的
 <table>
   <thead>
     <tr>
-      <th width="100%">QQ 群</th>
+      <th width="50%">QQ 群</th>
+      <th width="50%">微信群</th>
     </tr>
   </thead>
   <tbody>
@@ -114,6 +115,13 @@ SimAdmin 是一套面向 Debian 蜂窝 CPE、随身 WiFi、软路由类设备的
           <source media="(prefers-color-scheme: dark)" srcset="./static/Community/Community_QQ_Dark.png" />
           <source media="(prefers-color-scheme: light)" srcset="./static/Community/Community_QQ_Light.png" />
           <img src="./static/Community/Community_QQ_Light.png" />
+        </picture>
+      </td>
+      <td>
+        <picture>
+          <source media="(prefers-color-scheme: dark)" srcset="https://raw.giteeusercontent.com/v2599/Notify/raw/simadmin/Community_Wechat_Dark.png" />
+          <source media="(prefers-color-scheme: light)" srcset="https://raw.giteeusercontent.com/v2599/Notify/raw/simadmin/Community_Wechat_Light.png" />
+          <img src="https://raw.giteeusercontent.com/v2599/Notify/raw/simadmin/Community_Wechat_Light.png" />
         </picture>
       </td>
     </tr>
@@ -222,6 +230,12 @@ Windows 下建议在 WSL2 Ubuntu 中执行完整 OTA 构建。原生 PowerShell 
 curl -fsSL https://raw.githubusercontent.com/3899/SimAdmin/main/install_latest.sh | sh
 ```
 
+国内网络环境：
+
+```bash
+curl -fsSL https://gh-proxy.com/https://raw.githubusercontent.com/3899/SimAdmin/main/install_latest.sh | sh
+```
+
 可选环境变量：
 
 ```bash
@@ -231,7 +245,7 @@ curl -fsSL https://raw.githubusercontent.com/3899/SimAdmin/main/install_latest.s
 
 脚本会：
 
-- 从 GitHub Release 下载 `simadmin_latest.tar.gz` 或指定版本包。
+- 从 GitHub Release 下载 `simadmin.tar.gz`。
 - 安装后端二进制到 `/opt/simadmin/simadmin`。
 - 安装前端到 `/opt/simadmin/www`。
 - 安装并启用 `simadmin.service`。
@@ -244,6 +258,12 @@ curl -fsSL https://raw.githubusercontent.com/3899/SimAdmin/main/install_latest.s
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/3899/SimAdmin/main/uninstall.sh | sh
+```
+
+国内网络环境：
+
+```bash
+curl -fsSL https://gh-proxy.com/https://raw.githubusercontent.com/3899/SimAdmin/main/uninstall.sh | sh
 ```
 
 如需保留短信数据库和配置文件：
@@ -291,7 +311,8 @@ curl -fsSL https://raw.githubusercontent.com/3899/SimAdmin/main/uninstall.sh \
 - 建议安装 `qmicli`，用于基站信息兜底读取。
 - `iptables` / `ip6tables`，用于只读网络诊断；SimAdmin 不会自动清空宿主机防火墙规则。
 - `tar`，OTA 安装必需。
-- `unzip`，仅在上传 zip 格式 OTA 包时需要。
+- `unzip`、`busybox unzip` 或 `python3`，用于安装脚本解压自动下载的 `lpac`；`unzip` 也用于上传 zip 格式 OTA 包。
+- eSIM 管理依赖 `lpac`。使用 `install_latest.sh` 安装时会按设备架构自动下载官方最新匹配版本到私有目录；普通 SIM 模式下不会调用。
 
 ### 安装路径
 
@@ -299,6 +320,7 @@ curl -fsSL https://raw.githubusercontent.com/3899/SimAdmin/main/uninstall.sh \
 |------|------|
 | `/opt/simadmin/simadmin` | 后端二进制 |
 | `/opt/simadmin/www/` | 前端静态文件 |
+| `/opt/simadmin/lpac/` | 安装脚本按设备架构下载的私有 `lpac` 运行文件，后端优先使用 |
 | `/opt/simadmin/data.db` | SQLite 数据库，保存短信等业务数据 |
 | `/opt/simadmin/meta.json` | 当前安装包元数据 |
 | `/data/config.json` | 优先使用的持久化配置文件 |
@@ -308,6 +330,16 @@ curl -fsSL https://raw.githubusercontent.com/3899/SimAdmin/main/uninstall.sh \
 | `/etc/systemd/system/simadmin-modem-recovery.service` | 开机 modem 自检恢复服务 |
 | `/usr/local/bin/simadmin-modem-recovery.sh` | 开机 modem 自检恢复脚本 |
 | `/etc/NetworkManager/conf.d/99-simadmin-unmanaged-modem.conf` | NetworkManager 忽略 `wwan*` 的配置 |
+
+### eSIM 管理
+
+本项目中的 eSIM 指写入了 Profiles 的实体 eUICC SIM 卡，插入设备 SIM 卡槽后仍按普通 SIM 使用。SimAdmin 的“eSIM 模式”只控制 eSIM 管理页面和接口是否开放，不切换设备板载硬件。
+
+普通 SIM 模式下，侧边栏隐藏 eSIM 管理入口，`/api/esim/*` 返回 `403`，前端不会下载 eSIM 页面 chunk，后端也不会主动调用 `lpac`。切换到 eSIM 模式后，只有打开 eSIM 管理页面或执行 Profile 操作时才会按需调用 `lpac chip info`、`lpac profile list`、`lpac profile enable`、`lpac profile nickname` 和 `lpac profile delete`。
+
+OTA 包不内置固定架构的 `lpac`。`install_latest.sh` 会在目标设备上根据 `uname -m` 和 glibc 版本优先选择兼容资产，安装到 `/opt/simadmin/lpac/lpac`；后端优先使用该私有路径，找不到时再回退到 PATH 中的 `lpac`。如需跳过自动安装，可设置 `SIMADMIN_INSTALL_LPAC=0`；如需固定版本或使用镜像，可设置 `LPAC_ASSET_URL`、`LPAC_ASSET_NAME`、`LPAC_RELEASE_BASE_URL` 或 `LPAC_COMPAT_RELEASE_BASE_URL`。仅手动上传 OTA 包不会自动安装或更新 `lpac`，首次部署建议先执行安装脚本一次。
+
+如果设备已经通过 OTA 更新到支持 eSIM 的版本，但还没有安装 `lpac`，eSIM 管理页面会显示状态提示并提供“安装/修复 lpac”入口。修复过程只在 eSIM 模式下由用户手动触发，会根据设备 `uname -m` 和 glibc 版本优先下载兼容资产，失败后再尝试官方资产，并支持选择 GitHub 代理前缀；页面内修复由后端内置 ZIP 解压完成。
 
 ### systemd 服务
 
@@ -333,6 +365,7 @@ journalctl -u simadmin -f
 |------|------|------|
 | 仪表盘 | `/` | 在线状态、运营商、信号、网络延迟、数据/漫游/飞行模式快捷开关、系统资源、温度、流量 |
 | 设备信息 | `/device` | IMEI、厂商、型号、固件、SIM、系统信息 |
+| eSIM 管理 | `/esim` | eSIM 模式下显示，管理插入设备的实体 eUICC SIM 卡 Profiles |
 | 蜂窝网络 | `/network` | 网络注册、服务小区和邻区、运营商扫描、APN、射频模式、频段锁定、小区锁定状态 |
 | 设备网络 | `/device-network` | WLAN 客户端联网、无线网络扫描和连接、DDNS 动态解析配置和同步日志 |
 | 短信管理 | `/sms` | 接收短信、发送短信、短信列表、会话、统计、删除对话、删除短信 |
@@ -354,6 +387,8 @@ journalctl -u simadmin -f
 - 短信发送、接收监听、SQLite 持久化和多渠道通知转发。
 - APN 列表读取和 APN 修改。
 - 运营商列表、扫描、手动注册、自动注册。
+- eSIM 模式下按需调用 `lpac` 管理实体 eUICC SIM 卡 Profiles；普通 SIM 模式下不调用 eSIM 能力。
+- 安装脚本按设备架构自动准备私有 `lpac`；OTA 包本身不绑定 `lpac` 架构或版本。
 - OTA 上传、在线下载、校验、替换二进制和前端资源。
 
 ## 🚀 版本更新记录
@@ -362,25 +397,34 @@ journalctl -u simadmin -f
 
 #### ✨ 新增功能
 
-- 新增短信中心号码多源读取与缓存能力，支持多通道静默提取，命中即止。
-- 新增短信中心号码缓存表 smsc_cache，基于 SIM 标识存储学习到的 SMSC，接收短信时自动学习，支持快速复用。
-- 新增本机号码多源读取与缓存能力，支持多通道静默提取，命中即止。
-- 通知模板新增本机号码变量。
-
-#### 🐞 bug 修复
-
-- 修复 PushPlus 在部分配置场景下可能报错的问题，提升 PushPlus 通知渠道的兼容性。
-- 修复短信中心号码读取时，ModemManager 非调试模式产生的未授权告警问题。
+- 新增短信中心号码、本机号码多源读取 + 缓存能力，多通道静默提取、命中即止。
+- 新增缓存表，接收短信时自动学习并持久化存储短信中心号码、本机号码。
+- 新增 SIM / eSIM 工作模式功能开关，默认保持普通 SIM 模式。
+- 依托 `lpac` 实现实体 eUICC 卡轻量 eSIM 管理，配套管理页面支持卡信息查看、配置文件切换、重命名与删除。
+- 通知模板新增本机号码变量，适配短信转发场景。
 
 #### 💫 体验优化
 
-- 短信中心号码、本机号码读取失败均静默处理，不影响功能与页面展示。
+- 短信中心号码、本机号码读取失败均静默处理，不影响功能使用与页面展示。
+- 优化短信接收可靠性，服务启动、Profile 切换和基带恢复后会主动检查未同步短信。
+- 优化短信去重策略，减少设备重启或短信编号复用导致的误判漏收。
 - 采用命中即停策略，减少冗余调制解调器指令调用，降低日志干扰。
+- 优化系统配置页面 UI，调整布局并新增工作模式卡片。
+- 侧边栏随工作模式动态隐藏 eSIM 相关入口，普通 SIM 模式不加载对应页面资源。
+- 优化 eSIM 调用逻辑，仅使用对应功能时调用 `lpac`，无需常驻后台进程。
+
+#### 🐞 bug 修复
+
+- 修复 PushPlus 部分配置场景报错问题，提升通知渠道兼容性。
+- 修复短信中心号码读取时，ModemManager 非调试模式的未授权告警问题。
+- 修复实体 eSIM 卡在 Profile 切换或基带恢复后，短信已到设备但 Web 页面未显示的问题。
 
 #### 📚 接口与文档更新
 
-- 数据库新增短信中心号码 / 本机号码缓存表，按运营商 / SIM 身份持久化存储学习到的号码信息。
-- README 通知中心说明补充本机号码模板变量。
+- 数据库新增号码缓存表，持久化存储 SMSC 与本机号码。
+- 新增工作模式、eSIM 管理全套 API 接口。
+- eSIM 接口适配 `lpac` 标准 JSON 输出，适配各类 eSIM 管理操作。
+- 完善文档，补充相关使用说明。
 
 ### 📌 v1.0.4
 
@@ -389,19 +433,19 @@ journalctl -u simadmin -f
 - 通知中心新增 PushPlus 通知渠道，支持配置 Token、标题模板、群组编码、消息模板、发送渠道、渠道参数和回调地址，并接入短信、DDNS 事件转发及测试发送。
 - 通知中心新增版本更新提醒：后台每天北京时间 10:00 检测一次，发现新版本时按渠道首次提醒一次，不对检测失败或无更新场景推送通知。
 
-#### 🐞 bug 修复
-
-- 修正 DDNS 模块 IPv6 公网地址判断逻辑，前后端统一以公网域 IPv6 作为 AAAA 记录候选地址，避免误选链路本地地址、内网 ULA 地址。
-- IPv6 地址候选按 `/128` 优先排序，提升多 IPv6 地址场景下 DDNS 自动选择地址的准确性。
-- 修复宿主机 `FORWARD` 默认策略为 `DROP` 时，清空 filter 表规则引发 Docker 网桥转发失效、外部无法访问容器映射端口的问题。
-- 修复企业微信应用消息可能报错的问题。
-
 #### 💫 体验优化
 
 - 抽象封装前端通用 IPv6 公网地址筛选工具，仪表盘连接展示、设备网络 DDNS 接口统一复用同一套判定规则。
 - 数据连接看门狗保留蜂窝状态巡检与 Modem 自愈能力，不再自动清空宿主机 iptables/ip6tables 规则，避免影响 Docker、VPN 及容器端口映射等业务。
 - 切换蜂窝数据连接时取消全局防火墙规则刷新，减少对宿主机网络栈、容器转发链路的副作用。
 - 通知中心统一在模板渲染层将短信、DDNS 的时间变量格式化为北京时间，避免各渠道收到 UTC 原始时间。
+
+#### 🐞 bug 修复
+
+- 修正 DDNS 模块 IPv6 公网地址判断逻辑，前后端统一以公网域 IPv6 作为 AAAA 记录候选地址，避免误选链路本地地址、内网 ULA 地址。
+- IPv6 地址候选按 `/128` 优先排序，提升多 IPv6 地址场景下 DDNS 自动选择地址的准确性。
+- 修复宿主机 `FORWARD` 默认策略为 `DROP` 时，清空 filter 表规则引发 Docker 网桥转发失效、外部无法访问容器映射端口的问题。
+- 修复企业微信应用消息可能报错的问题。
 
 #### 📚 接口与文档更新
 
@@ -727,6 +771,19 @@ busctl introspect org.freedesktop.ModemManager1 /org/freedesktop/ModemManager1/M
 | `/api/apn` | GET/POST | APN 列表和配置 |
 | `/api/baseband/restart` | POST | 重启基带并尝试恢复网络 |
 | `/api/baseband/restart/status` | GET | 基带重启进度 |
+| `/api/work-mode` | GET/POST | 读取或切换普通 SIM / eSIM 工作模式 |
+
+### eSIM 管理
+
+| 接口 | 方法 | 说明 |
+|------|------|------|
+| `/api/esim/lpac/status` | GET | 检测 `lpac` 安装路径、架构匹配和可用状态 |
+| `/api/esim/lpac/repair` | POST | 按设备架构下载并安装/修复私有 `lpac`，支持 `proxy_prefix` |
+| `/api/esim/euicc` | GET | 读取 eUICC 芯片信息 |
+| `/api/esim/profiles` | GET | 读取 Profiles 列表 |
+| `/api/esim/profiles/{iccid}/enable` | POST | 启用指定 Profile |
+| `/api/esim/profiles/{iccid}/rename` | POST | 重命名指定 Profile |
+| `/api/esim/profiles/{iccid}` | DELETE | 删除指定 Profile |
 
 ### 短信功能
 

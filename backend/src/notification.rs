@@ -194,7 +194,7 @@ impl NotificationSender {
         let test_message = SmsMessage {
             id: 0,
             direction: "incoming".to_string(),
-            phone_number: "+8613800138000".to_string(),
+            phone_number: "+10000".to_string(),
             content: "这是一条测试短信 (Notification Test)".to_string(),
             timestamp: beijing_now_string(),
             status: "received".to_string(),
@@ -770,7 +770,7 @@ impl NotificationSender {
                 .await
             {
                 Ok(result) => return Ok(result),
-                Err(WecomMessageError::InvalidAccessToken(err)) if !retried => {
+                Err(WecomMessageError::InvalidAccessToken(_)) if !retried => {
                     retried = true;
                     self.invalidate_wecom_access_token(corp_id, secret).await;
                     continue;
@@ -1833,7 +1833,7 @@ mod tests {
         let message = SmsMessage {
             id: 7,
             direction: "incoming".to_string(),
-            phone_number: "+8613800138000".to_string(),
+            phone_number: "+10000".to_string(),
             content: "hello".to_string(),
             timestamp: "2026-05-14T16:30:45Z".to_string(),
             status: "received".to_string(),
@@ -1852,14 +1852,14 @@ mod tests {
         let message = SmsMessage {
             id: 7,
             direction: "incoming".to_string(),
-            phone_number: "+8613800138000".to_string(),
+            phone_number: "+10000".to_string(),
             content: "hello".to_string(),
             timestamp: "2026-05-14T16:30:45Z".to_string(),
             status: "received".to_string(),
             pdu: None,
         };
         let context = SmsTemplateContext {
-            own_number: "+8613912345678".to_string(),
+            own_number: "+10001".to_string(),
         };
 
         assert_eq!(
@@ -1869,7 +1869,7 @@ mod tests {
                 &context,
                 false
             ),
-            "+8613912345678|+8613912345678|+8613912345678|+8613912345678"
+            "+10001|+10001|+10001|+10001"
         );
     }
 
@@ -1878,7 +1878,7 @@ mod tests {
         let call = CallRecord {
             id: 9,
             direction: "incoming".to_string(),
-            phone_number: "+8613800138000".to_string(),
+            phone_number: "+10000".to_string(),
             duration: 12,
             start_time: "2026-05-14T16:30:45Z".to_string(),
             end_time: Some("2026-05-14T16:31:45Z".to_string()),

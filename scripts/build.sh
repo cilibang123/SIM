@@ -309,7 +309,7 @@ if [ "$SKIP_OTA" = false ] && [ "$BUILD_BACKEND" = true ] && [ "$BUILD_FRONTEND"
         echo "复制前端文件..."
         mkdir -p "$OTA_TMP/www"
         cp -r "$FRONTEND_DIR"/* "$OTA_TMP/www/"
-        
+
         # 计算前端 MD5
         if is_macos; then
             FRONTEND_MD5=$(find "$OTA_TMP/www" -type f -exec md5 -q {} \; | sort | tr '\n' '\n' | md5 -q)

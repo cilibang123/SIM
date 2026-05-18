@@ -2,11 +2,14 @@
 //!
 //! 使用 SQLite 存储短信历史记录和通话记录
 
-use chrono::Utc;
-use rusqlite::{params, Connection, OptionalExtension, Result};
+use chrono::{DateTime, FixedOffset, NaiveDateTime, Utc};
+use rusqlite::{params, Connection, OptionalExtension, Result, Row};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+
+const BEIJING_UTC_OFFSET_SECONDS: i32 = 8 * 60 * 60;
+const SMS_TIMESTAMP_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
 
 /// 短信记录
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,9 +67,143 @@ pub struct OwnNumberCacheEntry {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct EsimProfileCacheEntry {
+    pub iccid: String,
+    pub name: Option<String>,
+    pub provider: Option<String>,
+    pub profile_class: Option<String>,
+    pub imsi: Option<String>,
+    pub msisdn: Option<String>,
+    pub smsc: Option<String>,
+    pub smdp: Option<String>,
+    pub isdp_aid: Option<String>,
+    pub mcc: Option<String>,
+    pub mnc: Option<String>,
+    pub updated_at: String,
+}
+
 /// 数据库管理器
 pub struct Database {
     conn: Arc<Mutex<Connection>>,
+}
+
+fn beijing_offset() -> FixedOffset {
+    FixedOffset::east_opt(BEIJING_UTC_OFFSET_SECONDS).expect("valid Beijing UTC offset")
+}
+
+pub fn beijing_sms_now_string() -> String {
+    Utc::now()
+        .with_timezone(&beijing_offset())
+        .format(SMS_TIMESTAMP_FORMAT)
+        .to_string()
+}
+
+pub fn normalize_sms_timestamp_for_display(timestamp: &str) -> Option<String> {
+    let timestamp = timestamp.trim();
+    if timestamp.is_empty() {
+        return None;
+    }
+
+    if let Some(parsed) = parse_sms_timestamp_with_offset(timestamp) {
+        return Some(parsed);
+    }
+
+    for format in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"] {
+        if let Ok(parsed) = NaiveDateTime::parse_from_str(timestamp, format) {
+            return Some(parsed.format(SMS_TIMESTAMP_FORMAT).to_string());
+        }
+    }
+
+    None
+}
+
+fn parse_sms_timestamp_with_offset(timestamp: &str) -> Option<String> {
+    let timestamp = timestamp.replace(' ', "T");
+
+    if let Ok(parsed) = DateTime::parse_from_rfc3339(&timestamp) {
+        return Some(
+            parsed
+                .with_timezone(&beijing_offset())
+                .format(SMS_TIMESTAMP_FORMAT)
+                .to_string(),
+        );
+    }
+
+    let offset_start = timestamp
+        .char_indices()
+        .rev()
+        .find_map(|(index, ch)| (index > 10 && matches!(ch, '+' | '-')).then_some(index))?;
+
+    let (datetime, offset) = timestamp.split_at(offset_start);
+    let normalized_offset = match offset.len() {
+        3 => format!("{offset}:00"),
+        5 if !offset.contains(':') => format!("{}:{}", &offset[..3], &offset[3..]),
+        _ => offset.to_string(),
+    };
+    let candidate = format!("{datetime}{normalized_offset}");
+
+    DateTime::parse_from_rfc3339(&candidate).ok().map(|parsed| {
+        parsed
+            .with_timezone(&beijing_offset())
+            .format(SMS_TIMESTAMP_FORMAT)
+            .to_string()
+    })
+}
+
+fn sms_timestamp_for_storage(timestamp: &str) -> String {
+    normalize_sms_timestamp_for_display(timestamp).unwrap_or_else(beijing_sms_now_string)
+}
+
+fn sms_timestamp_for_display(timestamp: String) -> String {
+    normalize_sms_timestamp_for_display(&timestamp).unwrap_or(timestamp)
+}
+
+fn sms_message_from_row(row: &Row<'_>) -> Result<SmsMessage> {
+    let timestamp: String = row.get(4)?;
+    Ok(SmsMessage {
+        id: row.get(0)?,
+        direction: row.get(1)?,
+        phone_number: row.get(2)?,
+        content: row.get(3)?,
+        timestamp: sms_timestamp_for_display(timestamp),
+        status: row.get(5)?,
+        pdu: row.get(6)?,
+    })
+}
+
+fn normalize_existing_sms_timestamps(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare("SELECT id, timestamp FROM sms_messages")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+    })?;
+
+    let mut updates = Vec::new();
+    for row in rows {
+        let (id, timestamp) = row?;
+        if let Some(normalized) = normalize_sms_timestamp_for_display(&timestamp) {
+            if normalized != timestamp {
+                updates.push((id, normalized));
+            }
+        }
+    }
+    drop(stmt);
+
+    for (id, timestamp) in updates {
+        conn.execute(
+            "UPDATE sms_messages SET timestamp = ?1 WHERE id = ?2",
+            params![timestamp, id],
+        )?;
+    }
+
+    Ok(())
+}
+
+fn non_empty_option(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
 }
 
 impl Database {
@@ -99,6 +236,7 @@ impl Database {
             "CREATE INDEX IF NOT EXISTS idx_sms_phone ON sms_messages(phone_number)",
             [],
         )?;
+        normalize_existing_sms_timestamps(&conn)?;
 
         // 创建通话记录表（如果不存在）
         conn.execute(
@@ -152,6 +290,24 @@ impl Database {
             [],
         )?;
 
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS esim_profile_cache (
+                iccid TEXT PRIMARY KEY,
+                name TEXT,
+                provider TEXT,
+                profile_class TEXT,
+                imsi TEXT,
+                msisdn TEXT,
+                smsc TEXT,
+                smdp TEXT,
+                isdp_aid TEXT,
+                mcc TEXT,
+                mnc TEXT,
+                updated_at TEXT NOT NULL
+            )",
+            [],
+        )?;
+
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -168,9 +324,21 @@ impl Database {
         status: &str,
         pdu: Option<&str>,
     ) -> Result<i64> {
-        let conn = self.conn.lock().unwrap();
-        let timestamp = Utc::now().to_rfc3339();
+        let timestamp = beijing_sms_now_string();
+        self.insert_sms_at(direction, phone_number, content, &timestamp, status, pdu)
+    }
 
+    pub fn insert_sms_at(
+        &self,
+        direction: &str,
+        phone_number: &str,
+        content: &str,
+        timestamp: &str,
+        status: &str,
+        pdu: Option<&str>,
+    ) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        let timestamp = sms_timestamp_for_storage(timestamp);
         conn.execute(
             "INSERT INTO sms_messages (direction, phone_number, content, timestamp, status, pdu)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -186,6 +354,45 @@ impl Database {
         let count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM sms_messages WHERE pdu = ?1",
             params![pdu],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    pub fn incoming_sms_exists_by_timestamp(
+        &self,
+        phone_number: &str,
+        content: &str,
+        timestamp: &str,
+    ) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let normalized_timestamp = normalize_sms_timestamp_for_display(timestamp)
+            .unwrap_or_else(|| timestamp.trim().to_string());
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sms_messages
+             WHERE direction = 'incoming'
+               AND phone_number = ?1
+               AND content = ?2
+               AND (timestamp = ?3 OR timestamp = ?4)",
+            params![phone_number, content, timestamp, normalized_timestamp],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    pub fn incoming_sms_exists_by_legacy_content(
+        &self,
+        phone_number: &str,
+        content: &str,
+    ) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sms_messages
+             WHERE direction = 'incoming'
+               AND phone_number = ?1
+               AND content = ?2
+               AND (pdu IS NULL OR pdu NOT LIKE 'mmfp:%')",
+            params![phone_number, content],
             |row| row.get(0),
         )?;
         Ok(count > 0)
@@ -209,17 +416,8 @@ impl Database {
                      LIMIT ?2 OFFSET ?3",
                 )?;
 
-                let messages = stmt.query_map(params![direction, limit, offset], |row| {
-                    Ok(SmsMessage {
-                        id: row.get(0)?,
-                        direction: row.get(1)?,
-                        phone_number: row.get(2)?,
-                        content: row.get(3)?,
-                        timestamp: row.get(4)?,
-                        status: row.get(5)?,
-                        pdu: row.get(6)?,
-                    })
-                })?;
+                let messages =
+                    stmt.query_map(params![direction, limit, offset], sms_message_from_row)?;
 
                 let mut result = Vec::new();
                 for message in messages {
@@ -236,17 +434,7 @@ impl Database {
                      LIMIT ?1 OFFSET ?2",
                 )?;
 
-                let messages = stmt.query_map(params![limit, offset], |row| {
-                    Ok(SmsMessage {
-                        id: row.get(0)?,
-                        direction: row.get(1)?,
-                        phone_number: row.get(2)?,
-                        content: row.get(3)?,
-                        timestamp: row.get(4)?,
-                        status: row.get(5)?,
-                        pdu: row.get(6)?,
-                    })
-                })?;
+                let messages = stmt.query_map(params![limit, offset], sms_message_from_row)?;
 
                 let mut result = Vec::new();
                 for message in messages {
@@ -269,17 +457,7 @@ impl Database {
              LIMIT ?2",
         )?;
 
-        let messages = stmt.query_map(params![phone_number, limit], |row| {
-            Ok(SmsMessage {
-                id: row.get(0)?,
-                direction: row.get(1)?,
-                phone_number: row.get(2)?,
-                content: row.get(3)?,
-                timestamp: row.get(4)?,
-                status: row.get(5)?,
-                pdu: row.get(6)?,
-            })
-        })?;
+        let messages = stmt.query_map(params![phone_number, limit], sms_message_from_row)?;
 
         let mut result = Vec::new();
         for message in messages {
@@ -356,6 +534,12 @@ impl Database {
 
         tx.commit()?;
         Ok(deleted)
+    }
+
+    pub fn vacuum(&self) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute_batch("VACUUM")?;
+        Ok(())
     }
 
     // ==================== SMSC cache ====================
@@ -496,6 +680,141 @@ impl Database {
             }
         }
         Ok(None)
+    }
+
+    // ==================== eSIM Profile cache ====================
+
+    pub fn upsert_esim_profile_cache(&self, entry: &EsimProfileCacheEntry) -> Result<()> {
+        if entry.iccid.trim().is_empty() {
+            return Ok(());
+        }
+
+        let has_profile_data = [
+            entry.name.as_deref(),
+            entry.provider.as_deref(),
+            entry.profile_class.as_deref(),
+            entry.imsi.as_deref(),
+            entry.msisdn.as_deref(),
+            entry.smsc.as_deref(),
+            entry.smdp.as_deref(),
+            entry.isdp_aid.as_deref(),
+            entry.mcc.as_deref(),
+            entry.mnc.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|value| !value.trim().is_empty());
+
+        if !has_profile_data {
+            return Ok(());
+        }
+
+        let conn = self.conn.lock().unwrap();
+        let updated_at = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO esim_profile_cache (
+                iccid, name, provider, profile_class, imsi, msisdn, smsc, smdp,
+                isdp_aid, mcc, mnc, updated_at
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+             ON CONFLICT(iccid) DO UPDATE SET
+                name = COALESCE(excluded.name, esim_profile_cache.name),
+                provider = COALESCE(excluded.provider, esim_profile_cache.provider),
+                profile_class = COALESCE(excluded.profile_class, esim_profile_cache.profile_class),
+                imsi = COALESCE(excluded.imsi, esim_profile_cache.imsi),
+                msisdn = COALESCE(excluded.msisdn, esim_profile_cache.msisdn),
+                smsc = COALESCE(excluded.smsc, esim_profile_cache.smsc),
+                smdp = COALESCE(excluded.smdp, esim_profile_cache.smdp),
+                isdp_aid = COALESCE(excluded.isdp_aid, esim_profile_cache.isdp_aid),
+                mcc = COALESCE(excluded.mcc, esim_profile_cache.mcc),
+                mnc = COALESCE(excluded.mnc, esim_profile_cache.mnc),
+                updated_at = excluded.updated_at",
+            params![
+                entry.iccid.trim(),
+                non_empty_option(entry.name.as_deref()),
+                non_empty_option(entry.provider.as_deref()),
+                non_empty_option(entry.profile_class.as_deref()),
+                non_empty_option(entry.imsi.as_deref()),
+                non_empty_option(entry.msisdn.as_deref()),
+                non_empty_option(entry.smsc.as_deref()),
+                non_empty_option(entry.smdp.as_deref()),
+                non_empty_option(entry.isdp_aid.as_deref()),
+                non_empty_option(entry.mcc.as_deref()),
+                non_empty_option(entry.mnc.as_deref()),
+                updated_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_esim_profile_cache(&self, iccid: &str) -> Result<Option<EsimProfileCacheEntry>> {
+        let iccid = iccid.trim();
+        if iccid.is_empty() {
+            return Ok(None);
+        }
+
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT iccid, name, provider, profile_class, imsi, msisdn, smsc, smdp,
+                    isdp_aid, mcc, mnc, updated_at
+             FROM esim_profile_cache
+             WHERE iccid = ?1",
+            params![iccid],
+            |row| {
+                Ok(EsimProfileCacheEntry {
+                    iccid: row.get(0)?,
+                    name: row.get(1)?,
+                    provider: row.get(2)?,
+                    profile_class: row.get(3)?,
+                    imsi: row.get(4)?,
+                    msisdn: row.get(5)?,
+                    smsc: row.get(6)?,
+                    smdp: row.get(7)?,
+                    isdp_aid: row.get(8)?,
+                    mcc: row.get(9)?,
+                    mnc: row.get(10)?,
+                    updated_at: row.get(11)?,
+                })
+            },
+        )
+        .optional()
+    }
+
+    pub fn list_esim_profile_cache(&self) -> Result<Vec<EsimProfileCacheEntry>> {
+        let conn = self.conn.lock().unwrap();
+        let mut statement = conn.prepare(
+            "SELECT iccid, name, provider, profile_class, imsi, msisdn, smsc, smdp,
+                    isdp_aid, mcc, mnc, updated_at
+             FROM esim_profile_cache
+             ORDER BY updated_at DESC, iccid ASC",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(EsimProfileCacheEntry {
+                iccid: row.get(0)?,
+                name: row.get(1)?,
+                provider: row.get(2)?,
+                profile_class: row.get(3)?,
+                imsi: row.get(4)?,
+                msisdn: row.get(5)?,
+                smsc: row.get(6)?,
+                smdp: row.get(7)?,
+                isdp_aid: row.get(8)?,
+                mcc: row.get(9)?,
+                mnc: row.get(10)?,
+                updated_at: row.get(11)?,
+            })
+        })?;
+
+        rows.collect()
+    }
+
+    pub fn delete_esim_profile_cache(&self, iccid: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM esim_profile_cache WHERE iccid = ?1",
+            params![iccid.trim()],
+        )?;
+        Ok(())
     }
 
     // ==================== 通话记录相关方法 ====================

@@ -4,6 +4,82 @@
   data?: T
 }
 
+export type WorkMode = 'sim' | 'esim'
+
+export interface WorkModeResponse {
+  mode: WorkMode
+  worker_running: boolean
+}
+
+export interface WorkModeRequest {
+  mode: WorkMode
+  confirm: boolean
+}
+
+export interface EsimCommandResponse {
+  code: number
+  status: string
+  action: string
+  msg: string
+  data?: unknown
+}
+
+export interface EsimEuiccInfo {
+  eid: string
+  status: string
+  manufacturer: string
+  memory_total_kb?: number
+  memory_available_kb?: number
+  raw: unknown
+}
+
+export interface EsimProfile {
+  iccid: string
+  name: string
+  provider: string
+  state: string
+  class: string
+  imsi?: string
+  msisdn?: string
+  smsc?: string
+  smdp?: string
+  isdp_aid?: string
+  mcc?: string
+  mnc?: string
+  disable_allowed?: boolean
+  delete_allowed?: boolean
+  raw: unknown
+}
+
+export interface EsimProfilesResponse {
+  profiles: EsimProfile[]
+}
+
+export interface EsimLpacStatusResponse {
+  installed: boolean
+  usable: boolean
+  path: string
+  arch: string
+  glibc_version: string
+  asset_name: string
+  message: string
+  source?: string
+}
+
+export interface EsimLpacRepairRequest {
+  proxy_prefix?: string
+  asset_url?: string
+}
+
+export interface EsimLpacRepairResponse {
+  installed: boolean
+  path: string
+  arch: string
+  asset_name: string
+  asset_url: string
+  message: string
+}
+
 export interface DeviceInfo {
   imei: string
   manufacturer: string

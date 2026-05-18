@@ -57,7 +57,7 @@ export function SimCardInfo({ simInfo }: SimCardInfoProps) {
           <Box display="flex" justifyContent="space-between" alignItems="center" gap={2}>
             <Typography variant="caption" color="text.secondary">短信中心</Typography>
             <Typography variant="body2" sx={{ ...valueTextSx, ...getSensitiveStyle(showInfo) }}>
-              {simInfo?.sms_center || 'N/A'}
+              {simInfo?.sms_center || '未读取到'}
             </Typography>
           </Box>
         </Stack>

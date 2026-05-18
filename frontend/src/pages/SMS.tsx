@@ -55,6 +55,16 @@ type DeleteTarget =
   | { type: 'conversation'; phoneNumber: string; messageCount: number }
   | { type: 'message'; message: SmsMessage }
 
+function parseSmsTimestamp(timestamp: string): Date | null {
+  const normalized = timestamp.includes(' ') ? timestamp.replace(' ', 'T') : timestamp
+  const date = new Date(normalized)
+  return Number.isNaN(date.getTime()) ? null : date
+}
+
+function smsTimestampMillis(timestamp: string): number {
+  return parseSmsTimestamp(timestamp)?.getTime() ?? 0
+}
+
 function buildConversations(msgs: SmsMessage[]): ConversationGroup[] {
   const groups = new Map<string, SmsMessage[]>()
 
@@ -68,7 +78,7 @@ function buildConversations(msgs: SmsMessage[]): ConversationGroup[] {
 
   const conversationList: ConversationGroup[] = []
   groups.forEach((groupMessages, phoneNumber) => {
-    groupMessages.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
+    groupMessages.sort((a, b) => smsTimestampMillis(b.timestamp) - smsTimestampMillis(a.timestamp))
     conversationList.push({
       phoneNumber,
       messages: groupMessages,
@@ -78,7 +88,7 @@ function buildConversations(msgs: SmsMessage[]): ConversationGroup[] {
   })
 
   conversationList.sort(
-    (a, b) => new Date(b.lastMessage.timestamp).getTime() - new Date(a.lastMessage.timestamp).getTime(),
+    (a, b) => smsTimestampMillis(b.lastMessage.timestamp) - smsTimestampMillis(a.lastMessage.timestamp),
   )
 
   return conversationList
@@ -144,7 +154,7 @@ export default function SMSPage() {
       const response = await api.getSmsConversation({ phone_number: phone, limit: 1000 })
       if (response.status === 'ok' && response.data) {
         const sorted = [...response.data.messages].sort(
-          (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime(),
+          (a, b) => smsTimestampMillis(a.timestamp) - smsTimestampMillis(b.timestamp),
         )
         setConversationMessages(sorted)
         setTimeout(scrollToBottom, 100)
@@ -152,7 +162,7 @@ export default function SMSPage() {
     } catch {
       const localMsgs = messages.filter((m) => m.phone_number === phone)
       const sorted = [...localMsgs].sort(
-        (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime(),
+        (a, b) => smsTimestampMillis(a.timestamp) - smsTimestampMillis(b.timestamp),
       )
       setConversationMessages(sorted)
       setTimeout(scrollToBottom, 100)
@@ -507,7 +517,8 @@ export default function SMSPage() {
 
   const formatTime = (timestamp: string) => {
     try {
-      const date = new Date(timestamp)
+      const date = parseSmsTimestamp(timestamp)
+      if (!date) return timestamp
       const now = new Date()
       const isToday = date.toDateString() === now.toDateString()
       if (isToday) {
@@ -521,7 +532,8 @@ export default function SMSPage() {
 
   const formatShortTime = (timestamp: string) => {
     try {
-      const date = new Date(timestamp)
+      const date = parseSmsTimestamp(timestamp)
+      if (!date) return timestamp
       const now = new Date()
       const isToday = date.toDateString() === now.toDateString()
       if (isToday) {

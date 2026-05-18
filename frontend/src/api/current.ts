@@ -22,6 +22,12 @@ import type {
   DdnsStatusResponse,
   DdnsSyncResponse,
   DeviceInfo,
+  EsimCommandResponse,
+  EsimEuiccInfo,
+  EsimLpacRepairRequest,
+  EsimLpacRepairResponse,
+  EsimLpacStatusResponse,
+  EsimProfilesResponse,
   ManualRegisterRequest,
   NetworkInfo,
   NetworkInterfacesResponse,
@@ -45,6 +51,9 @@ import type {
   SmsStats,
   SystemStatsResponse,
   WebhookTestResponse,
+  WorkMode,
+  WorkModeRequest,
+  WorkModeResponse,
   WlanConnectRequest,
   WlanForgetRequest,
   WlanProfileRequest,
@@ -71,19 +80,45 @@ function throwIfApiEnvelopeError(payload: unknown): void {
 
 async function request<T>(
   url: string,
-  options: RequestInit & { returnText?: boolean } = {},
+  options: RequestInit & { returnText?: boolean; timeoutMs?: number } = {},
 ): Promise<T> {
-  const { returnText, ...fetchOptions } = options
+  const { returnText, timeoutMs, ...fetchOptions } = options
+  const controller = timeoutMs ? new AbortController() : undefined
+  const timeoutId = controller
+    ? window.setTimeout(() => controller.abort(), timeoutMs)
+    : undefined
 
-  const response = await fetch(`${API_BASE}${url}`, {
-    headers: {
-      'Content-Type': 'application/json',
-      ...fetchOptions.headers,
-    },
-    ...fetchOptions,
-  })
+  let response: Response
+  try {
+    response = await fetch(`${API_BASE}${url}`, {
+      headers: {
+        'Content-Type': 'application/json',
+        ...fetchOptions.headers,
+      },
+      ...fetchOptions,
+      signal: controller?.signal ?? fetchOptions.signal,
+    })
+  } catch (err) {
+    if (controller?.signal.aborted) {
+      throw new Error(`Request timed out after ${timeoutMs}ms`)
+    }
+    throw err
+  } finally {
+    if (timeoutId !== undefined) window.clearTimeout(timeoutId)
+  }
 
   if (!response.ok) {
+    let apiMessage: string | undefined
+    try {
+      const payload = await response.json()
+      if (typeof payload === 'object' && payload !== null && 'message' in payload) {
+        const message = (payload as { message?: unknown }).message
+        if (typeof message === 'string') apiMessage = message
+      }
+    } catch {
+      // Fall back to the HTTP status below.
+    }
+    if (apiMessage) throw new Error(apiMessage)
     throw new Error(`HTTP error! status: ${response.status}`)
   }
 
@@ -99,6 +134,74 @@ async function request<T>(
 class SimAdminCurrentAPI {
   async health() {
     return request<{ status: string; message: string; version: string }>('/health')
+  }
+
+  async getWorkMode() {
+    return request<ApiResponse<WorkModeResponse>>('/work-mode')
+  }
+
+  async setWorkMode(mode: WorkMode) {
+    const body: WorkModeRequest = { mode, confirm: true }
+    return request<ApiResponse<WorkModeResponse>>('/work-mode', {
+      method: 'POST',
+      body: JSON.stringify(body),
+      timeoutMs: 10000,
+    })
+  }
+
+  async getEsimEuicc() {
+    return request<ApiResponse<EsimEuiccInfo>>('/esim/euicc', {
+      timeoutMs: 30000,
+    })
+  }
+
+  async getEsimProfiles() {
+    return request<ApiResponse<EsimProfilesResponse>>('/esim/profiles', {
+      timeoutMs: 30000,
+    })
+  }
+
+  async getCachedEsimProfiles() {
+    return request<ApiResponse<EsimProfilesResponse>>('/esim/profiles?cached=1', {
+      timeoutMs: 5000,
+    })
+  }
+
+  async getEsimLpacStatus() {
+    return request<ApiResponse<EsimLpacStatusResponse>>('/esim/lpac/status', {
+      timeoutMs: 15000,
+    })
+  }
+
+  async repairEsimLpac(config: EsimLpacRepairRequest) {
+    return request<ApiResponse<EsimLpacRepairResponse>>('/esim/lpac/repair', {
+      method: 'POST',
+      body: JSON.stringify(config),
+      timeoutMs: 120000,
+    })
+  }
+
+  async enableEsimProfile(iccid: string) {
+    return request<ApiResponse<EsimCommandResponse>>(`/esim/profiles/${encodeURIComponent(iccid)}/enable`, {
+      method: 'POST',
+      body: JSON.stringify({}),
+      timeoutMs: 150000,
+    })
+  }
+
+  async renameEsimProfile(iccid: string, name: string) {
+    return request<ApiResponse<EsimCommandResponse>>(`/esim/profiles/${encodeURIComponent(iccid)}/rename`, {
+      method: 'POST',
+      body: JSON.stringify({ name }),
+      timeoutMs: 60000,
+    })
+  }
+
+  async deleteEsimProfile(iccid: string) {
+    return request<ApiResponse<EsimCommandResponse>>(`/esim/profiles/${encodeURIComponent(iccid)}`, {
+      method: 'DELETE',
+      timeoutMs: 60000,
+    })
   }
 
   async getDeviceInfo() {
