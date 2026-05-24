@@ -22,6 +22,12 @@ import type {
   NotificationRule,
   QuietHoursSchedule,
 } from '../../api/current'
+import {
+  DEFAULT_SYSTEM_EVENT_TEMPLATE,
+  SYSTEM_EVENT_TEMPLATE_VARIABLES,
+  defaultSystemEventCodes,
+} from './systemEventModel'
+
 export type IconComponent = ElementType<SvgIconProps>
 
 export type ChannelDef = {
@@ -58,6 +64,7 @@ export const EVENT_TYPES: { key: NotificationEventType; label: string }[] = [
   { key: 'sms', label: '短信' },
   { key: 'ddns', label: 'DDNS' },
   { key: 'version_update', label: '版本更新' },
+  { key: 'system_event', label: '系统事件' },
 ]
 
 export const WEEKDAYS = [
@@ -100,12 +107,14 @@ export const MATCH_FIELDS: Record<NotificationEventType, { value: string; label:
     { value: 'asset_name', label: '固件包' },
     { value: 'commit', label: 'Commit' },
   ],
+  system_event: [],
 }
 
 export const DEFAULT_TEMPLATES: Record<NotificationEventType, string> = {
   sms: '📱 短信通知\n号码: {{发送方号码}}\n内容: {{短信内容}}\n时间: {{时间}}\n来源: {{本机号码}}',
   ddns: 'DDNS 通知\n域名: {{域名}}\nIP 类型: {{IP类型}}\n新 IP: {{新IP}}\n旧 IP: {{旧IP}}\n服务商: {{服务商}}\n记录类型: {{记录类型}}\n状态: {{状态}}\n消息: {{消息}}\n更新时间: {{更新时间}}',
   version_update: '发现新版本\n固件包: {{固件包}}\n版本号: {{版本号}}\nCommit: {{Commit}}\n构建时间: {{构建时间}}\nMD5: {{MD5}}',
+  system_event: DEFAULT_SYSTEM_EVENT_TEMPLATE,
 }
 
 export const TEMPLATE_VARIABLES: Record<NotificationEventType, TemplateVariable[]> = {
@@ -136,6 +145,7 @@ export const TEMPLATE_VARIABLES: Record<NotificationEventType, TemplateVariable[
     { label: '构建时间', token: '{{构建时间}}' },
     { label: 'MD5', token: '{{MD5}}' },
   ],
+  system_event: SYSTEM_EVENT_TEMPLATE_VARIABLES,
 }
 
 export function createDefaultConfig(): NotificationConfig {
@@ -146,6 +156,7 @@ function normalizeRule(rule: NotificationRule): NotificationRule {
   const threshold = Number(rule.ddns_failure_threshold)
   return {
     ...rule,
+    event_codes: Array.isArray(rule.event_codes) ? rule.event_codes : [],
     ddns_failure_threshold: Number.isFinite(threshold) && threshold > 0 ? Math.trunc(threshold) : 1,
   }
 }
@@ -173,7 +184,6 @@ export function statusLabel(status: NotificationLogStatus) {
   if (status === 'failed') return '失败'
   if (status === 'quiet_hours') return '免打扰'
   if (status === 'unmatched') return '未匹配规则'
-  if (status === 'threshold_waiting') return '未达阈值'
   return '无可用通道'
 }
 
@@ -181,7 +191,6 @@ export function statusColor(status: NotificationLogStatus): 'primary' | 'error' 
   if (status === 'success') return 'primary'
   if (status === 'failed') return 'error'
   if (status === 'quiet_hours') return 'warning'
-  if (status === 'threshold_waiting') return 'warning'
   return 'default'
 }
 
@@ -261,6 +270,7 @@ export function createRule(type: NotificationEventType, channelIds: string[]): N
     enabled: true,
     matcher: { field: 'summary', operator: 'always', value: '' },
     channel_ids: channelIds,
+    event_codes: type === 'system_event' ? defaultSystemEventCodes() : [],
     template: DEFAULT_TEMPLATES[type],
     quiet_hours: [],
     ddns_failure_threshold: 1,

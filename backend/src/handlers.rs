@@ -34,6 +34,10 @@ use crate::{
         set_data_connection_with_apn, set_radio_mode, start_cell_monitoring, stop_cell_monitoring,
     },
     state::AppState,
+    system_event::{
+        codes as system_event_codes, mask_identifier, severity as system_event_severity,
+        status as system_event_status,
+    },
     utils::{
         connection_addresses_from_interfaces, format_uptime, get_active_interfaces, read_cpu_info,
         read_cpu_load_sync, read_disk_info, read_interface_stats, read_memory_info,
@@ -312,11 +316,25 @@ pub async fn set_work_mode_handler(
         );
     }
 
+    let previous_mode = app.config_manager.get_work_mode();
     match app.esim_supervisor.switch_mode(payload.mode).await {
-        Ok(data) => (
-            StatusCode::OK,
-            Json(ApiResponse::success_with_message("Work mode updated", data)),
-        ),
+        Ok(data) => {
+            if previous_mode != data.mode {
+                app.system_event_emitter
+                    .emit_code(
+                        system_event_codes::ESIM_WORK_MODE_CHANGED,
+                        system_event_severity::INFO,
+                        system_event_status::CHANGED,
+                        "work_mode",
+                        format!("工作模式从 {} 切换为 {}", previous_mode, data.mode),
+                    )
+                    .await;
+            }
+            (
+                StatusCode::OK,
+                Json(ApiResponse::success_with_message("Work mode updated", data)),
+            )
+        }
         Err(err) => (
             StatusCode::OK,
             Json(ApiResponse::<WorkModeResponse>::error(err)),
@@ -341,11 +359,34 @@ pub async fn repair_esim_lpac_handler(
     Json(payload): Json<EsimLpacRepairRequest>,
 ) -> impl IntoResponse {
     match app.esim_supervisor.repair_lpac(payload).await {
-        Ok(data) => (
-            StatusCode::OK,
-            Json(ApiResponse::success_with_message("lpac repaired", data)),
-        ),
-        Err(err) => esim_error_response::<EsimLpacRepairResponse>(err),
+        Ok(data) => {
+            app.system_event_emitter
+                .emit_code(
+                    system_event_codes::ESIM_LPAC_REPAIR_SUCCEEDED,
+                    system_event_severity::INFO,
+                    system_event_status::SUCCEEDED,
+                    "lpac",
+                    "lpac 修复成功",
+                )
+                .await;
+            (
+                StatusCode::OK,
+                Json(ApiResponse::success_with_message("lpac repaired", data)),
+            )
+        }
+        Err(err) => {
+            let message = err.message();
+            app.system_event_emitter
+                .emit_code(
+                    system_event_codes::ESIM_LPAC_REPAIR_FAILED,
+                    system_event_severity::WARNING,
+                    system_event_status::FAILED,
+                    "lpac",
+                    format!("lpac 修复失败: {message}"),
+                )
+                .await;
+            esim_error_response::<EsimLpacRepairResponse>(err)
+        }
     }
 }
 
@@ -433,7 +474,8 @@ pub async fn enable_esim_profile_handler(
     State(app): State<AppState>,
     Path(iccid): Path<String>,
 ) -> impl IntoResponse {
-    match app.esim_supervisor.enable_profile(iccid).await {
+    let event_entity = mask_identifier(&iccid);
+    match app.esim_supervisor.enable_profile(iccid.clone()).await {
         Ok(mut data) => {
             if esim_command_succeeded(&data) {
                 let auto_connect_data = !app.data_user_disabled.load(Ordering::SeqCst);
@@ -460,6 +502,15 @@ pub async fn enable_esim_profile_handler(
                         } else {
                             warn!("Failed to request SMS resync after eSIM profile switch");
                         }
+                        app.system_event_emitter
+                            .emit_code(
+                                system_event_codes::ESIM_PROFILE_ENABLE_SUCCEEDED,
+                                system_event_severity::INFO,
+                                system_event_status::SUCCEEDED,
+                                event_entity.clone(),
+                                "Profile 启用成功，基带恢复完成",
+                            )
+                            .await;
                     }
                     Err(err) => {
                         data.code = 1;
@@ -467,6 +518,15 @@ pub async fn enable_esim_profile_handler(
                         data.msg = format!(
                             "Profile enable command succeeded, but modem SIM power-cycle failed: {err}"
                         );
+                        app.system_event_emitter
+                            .emit_code(
+                                system_event_codes::ESIM_PROFILE_SWITCH_BASEBAND_RECOVERY_FAILED,
+                                system_event_severity::CRITICAL,
+                                system_event_status::FAILED,
+                                event_entity.clone(),
+                                format!("Profile 切换后基带恢复失败: {err}"),
+                            )
+                            .await;
                         if app
                             .sms_resync
                             .request_scan("profile-switch-recovery-failed")
@@ -479,6 +539,16 @@ pub async fn enable_esim_profile_handler(
                         }
                     }
                 }
+            } else {
+                app.system_event_emitter
+                    .emit_code(
+                        system_event_codes::ESIM_PROFILE_ENABLE_FAILED,
+                        system_event_severity::WARNING,
+                        system_event_status::FAILED,
+                        event_entity.clone(),
+                        format!("Profile 启用失败: {}", data.msg),
+                    )
+                    .await;
             }
             (
                 StatusCode::OK,
@@ -488,7 +558,19 @@ pub async fn enable_esim_profile_handler(
                 )),
             )
         }
-        Err(err) => esim_error_response::<EsimCommandResponse>(err),
+        Err(err) => {
+            let message = err.message();
+            app.system_event_emitter
+                .emit_code(
+                    system_event_codes::ESIM_PROFILE_ENABLE_FAILED,
+                    system_event_severity::WARNING,
+                    system_event_status::FAILED,
+                    event_entity,
+                    format!("Profile 启用失败: {message}"),
+                )
+                .await;
+            esim_error_response::<EsimCommandResponse>(err)
+        }
     }
 }
 
@@ -527,6 +609,15 @@ pub async fn delete_esim_profile_handler(
                 if let Err(err) = app.database.delete_esim_profile_cache(&iccid) {
                     warn!(iccid = %iccid, error = %err, "Failed to delete eSIM profile cache");
                 }
+                app.system_event_emitter
+                    .emit_code(
+                        system_event_codes::ESIM_PROFILE_DELETED,
+                        system_event_severity::WARNING,
+                        system_event_status::SUCCEEDED,
+                        mask_identifier(&iccid),
+                        "Profile 已删除",
+                    )
+                    .await;
             }
             (
                 StatusCode::OK,
@@ -1322,30 +1413,88 @@ pub async fn forget_device_wlan_handler(
 
 /// POST /api/device-network/wlan/connect
 pub async fn connect_device_wlan_handler(
+    State(app): State<AppState>,
     Json(payload): Json<WlanConnectRequest>,
 ) -> impl IntoResponse {
+    let target_ssid = payload.ssid.clone();
+    let previous = crate::device_network::wlan_status().await.ok();
     match crate::device_network::wlan_connect(payload).await {
-        Ok(data) => (
-            StatusCode::OK,
-            Json(ApiResponse::success_with_message("WLAN connected", data)),
-        ),
-        Err(err) => (
-            StatusCode::OK,
-            Json(ApiResponse::<WlanStatusResponse>::error(format!(
-                "Failed: {}",
-                err
-            ))),
-        ),
+        Ok(data) => {
+            if data.connected {
+                app.system_event_emitter
+                    .emit_code(
+                        system_event_codes::DEVICE_NETWORK_WLAN_CONNECTED,
+                        system_event_severity::INFO,
+                        system_event_status::SUCCEEDED,
+                        data.ssid.clone().unwrap_or_else(|| target_ssid.clone()),
+                        "WLAN 已连接",
+                    )
+                    .await;
+                let previous_ssid = previous.and_then(|status| status.ssid);
+                if previous_ssid.is_some() && previous_ssid != data.ssid && data.ssid.is_some() {
+                    app.system_event_emitter
+                        .emit_code(
+                            system_event_codes::DEVICE_NETWORK_WLAN_SSID_CHANGED,
+                            system_event_severity::INFO,
+                            system_event_status::CHANGED,
+                            data.ssid.clone().unwrap_or_default(),
+                            "WLAN SSID 已变化",
+                        )
+                        .await;
+                }
+            }
+            (
+                StatusCode::OK,
+                Json(ApiResponse::success_with_message("WLAN connected", data)),
+            )
+        }
+        Err(err) => {
+            app.system_event_emitter
+                .emit_code(
+                    system_event_codes::DEVICE_NETWORK_WLAN_CONNECT_FAILED,
+                    system_event_severity::WARNING,
+                    system_event_status::FAILED,
+                    target_ssid,
+                    format!("WLAN 连接失败: {err}"),
+                )
+                .await;
+            (
+                StatusCode::OK,
+                Json(ApiResponse::<WlanStatusResponse>::error(format!(
+                    "Failed: {}",
+                    err
+                ))),
+            )
+        }
     }
 }
 
 /// POST /api/device-network/wlan/disconnect
-pub async fn disconnect_device_wlan_handler() -> impl IntoResponse {
+pub async fn disconnect_device_wlan_handler(State(app): State<AppState>) -> impl IntoResponse {
+    let previous = crate::device_network::wlan_status().await.ok();
     match crate::device_network::wlan_disconnect().await {
-        Ok(data) => (
-            StatusCode::OK,
-            Json(ApiResponse::success_with_message("WLAN disconnected", data)),
-        ),
+        Ok(data) => {
+            if previous
+                .as_ref()
+                .map(|status| status.connected)
+                .unwrap_or(false)
+                && !data.connected
+            {
+                app.system_event_emitter
+                    .emit_code(
+                        system_event_codes::DEVICE_NETWORK_WLAN_DISCONNECTED,
+                        system_event_severity::INFO,
+                        system_event_status::CHANGED,
+                        previous.and_then(|status| status.ssid).unwrap_or_default(),
+                        "WLAN 已断开",
+                    )
+                    .await;
+            }
+            (
+                StatusCode::OK,
+                Json(ApiResponse::success_with_message("WLAN disconnected", data)),
+            )
+        }
         Err(err) => (
             StatusCode::OK,
             Json(ApiResponse::<WlanStatusResponse>::error(format!(
@@ -1432,6 +1581,7 @@ pub async fn set_data_status(
     State(app): State<AppState>,
     Json(payload): Json<DataConnectionRequest>,
 ) -> impl IntoResponse {
+    let previous_active = !app.data_user_disabled.load(Ordering::SeqCst);
     let allow_roaming = app.config_manager.get_roaming_allowed();
     let apn_config = app.config_manager.get_apn_config();
     match set_data_connection_with_apn(
@@ -1454,6 +1604,21 @@ pub async fn set_data_status(
             }
             app.data_user_disabled
                 .store(!payload.active, Ordering::SeqCst);
+            if previous_active != payload.active {
+                app.system_event_emitter
+                    .emit_code(
+                        system_event_codes::CELLULAR_DATA_ENABLED_CHANGED,
+                        system_event_severity::INFO,
+                        system_event_status::CHANGED,
+                        "cellular_data",
+                        if payload.active {
+                            "蜂窝数据开关已开启"
+                        } else {
+                            "蜂窝数据开关已关闭"
+                        },
+                    )
+                    .await;
+            }
             // 同步 NM autoconnect 状态，防止用户关闭数据后 NM 自动重连
             tokio::spawn(async move {
                 if let Ok(profile) = find_nm_modem_connection_pub().await {
@@ -1548,9 +1713,25 @@ pub async fn set_roaming_status_handler(
     State(app): State<AppState>,
     Json(payload): Json<RoamingRequest>,
 ) -> impl IntoResponse {
+    let previous_allowed = app.config_manager.get_roaming_allowed();
     match apply_roaming_policy(&app.dbus_conn, &app.config_manager, payload.allowed).await {
         Ok(_) => {
             let roaming_allowed = app.config_manager.get_roaming_allowed();
+            if previous_allowed != roaming_allowed {
+                app.system_event_emitter
+                    .emit_code(
+                        system_event_codes::CELLULAR_ROAMING_ALLOWED_CHANGED,
+                        system_event_severity::INFO,
+                        system_event_status::CHANGED,
+                        "roaming",
+                        if roaming_allowed {
+                            "允许漫游已开启"
+                        } else {
+                            "允许漫游已关闭"
+                        },
+                    )
+                    .await;
+            }
             match get_is_roaming_mm(&app.dbus_conn).await {
                 Ok(is_roaming) => (
                     StatusCode::OK,
@@ -1586,6 +1767,10 @@ pub async fn set_airplane_mode_handler(
     State(app): State<AppState>,
     Json(payload): Json<AirplaneModeRequest>,
 ) -> impl IntoResponse {
+    let previous_enabled = get_airplane_mode(&app.dbus_conn)
+        .await
+        .ok()
+        .map(|status| status.enabled);
     if payload.enabled {
         app.airplane_mode_requested.store(true, Ordering::SeqCst);
     }
@@ -1595,17 +1780,34 @@ pub async fn set_airplane_mode_handler(
             app.airplane_mode_requested
                 .store(payload.enabled, Ordering::SeqCst);
             match get_airplane_mode(&app.dbus_conn).await {
-                Ok(status) => (
-                    StatusCode::OK,
-                    Json(ApiResponse::success_with_message(
-                        if payload.enabled {
-                            "Airplane mode enabled"
-                        } else {
-                            "Airplane mode disabled"
-                        },
-                        status,
-                    )),
-                ),
+                Ok(status) => {
+                    if previous_enabled != Some(status.enabled) {
+                        app.system_event_emitter
+                            .emit_code(
+                                system_event_codes::CELLULAR_AIRPLANE_MODE_CHANGED,
+                                system_event_severity::INFO,
+                                system_event_status::CHANGED,
+                                "airplane_mode",
+                                if status.enabled {
+                                    "飞行模式已开启"
+                                } else {
+                                    "飞行模式已关闭"
+                                },
+                            )
+                            .await;
+                    }
+                    (
+                        StatusCode::OK,
+                        Json(ApiResponse::success_with_message(
+                            if payload.enabled {
+                                "Airplane mode enabled"
+                            } else {
+                                "Airplane mode disabled"
+                            },
+                            status,
+                        )),
+                    )
+                }
                 Err(e) => (
                     StatusCode::OK,
                     Json(ApiResponse::<AirplaneModeResponse>::error(format!(
@@ -2488,10 +2690,23 @@ fn parse_ping_latency(output: &str) -> Option<f64> {
 }
 
 /// POST /api/system/reboot
-pub async fn system_reboot(Json(payload): Json<SystemRebootRequest>) -> impl IntoResponse {
+pub async fn system_reboot(
+    State(app): State<AppState>,
+    Json(payload): Json<SystemRebootRequest>,
+) -> impl IntoResponse {
     let delay = payload.delay_seconds;
+    app.system_event_emitter
+        .emit_code(
+            system_event_codes::SYSTEM_SERVICE_REBOOT_REQUESTED,
+            system_event_severity::WARNING,
+            system_event_status::TRIGGERED,
+            "system",
+            format!("用户触发系统重启，延迟 {} 秒执行", delay),
+        )
+        .await;
+    let system_events = Arc::clone(&app.system_event_emitter);
     tokio::spawn(async move {
-        run_safe_os_reboot_sequence(delay).await;
+        run_safe_os_reboot_sequence(delay, system_events).await;
     });
     (
         StatusCode::OK,
@@ -2502,23 +2717,58 @@ pub async fn system_reboot(Json(payload): Json<SystemRebootRequest>) -> impl Int
     )
 }
 
-async fn run_safe_os_reboot_sequence(delay_seconds: u32) {
+async fn run_safe_os_reboot_sequence(
+    delay_seconds: u32,
+    system_events: Arc<crate::system_event::SystemEventEmitter>,
+) {
     if delay_seconds > 0 {
         tokio::time::sleep(tokio::time::Duration::from_secs(delay_seconds as u64)).await;
     }
 
     info!("Starting safe OS reboot sequence");
 
-    run_reboot_prep_command("disable modem radio", "mmcli", &["-m", "0", "-d"], false);
-    run_reboot_prep_command(
+    if let Some(message) =
+        run_reboot_prep_command("disable modem radio", "mmcli", &["-m", "0", "-d"], false)
+    {
+        system_events
+            .emit_code(
+                system_event_codes::SYSTEM_SERVICE_REBOOT_PREP_FAILED,
+                system_event_severity::WARNING,
+                system_event_status::FAILED,
+                "disable modem radio",
+                message,
+            )
+            .await;
+    }
+    if let Some(message) = run_reboot_prep_command(
         "stop ModemManager IPC service",
         "systemctl",
         &["stop", "ModemManager"],
         false,
-    );
-    run_reboot_prep_command("stop qmi-proxy", "killall", &["qmi-proxy"], true);
+    ) {
+        system_events
+            .emit_code(
+                system_event_codes::SYSTEM_SERVICE_REBOOT_PREP_FAILED,
+                system_event_severity::WARNING,
+                system_event_status::FAILED,
+                "stop ModemManager IPC service",
+                message,
+            )
+            .await;
+    }
+    let _ = run_reboot_prep_command("stop qmi-proxy", "killall", &["qmi-proxy"], true);
     cleanup_modemmanager_runtime_cache();
-    run_reboot_prep_command("flush filesystem cache", "sync", &[], false);
+    if let Some(message) = run_reboot_prep_command("flush filesystem cache", "sync", &[], false) {
+        system_events
+            .emit_code(
+                system_event_codes::SYSTEM_SERVICE_REBOOT_PREP_FAILED,
+                system_event_severity::WARNING,
+                system_event_status::FAILED,
+                "flush filesystem cache",
+                message,
+            )
+            .await;
+    }
 
     tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
 
@@ -2528,10 +2778,16 @@ async fn run_safe_os_reboot_sequence(delay_seconds: u32) {
     }
 }
 
-fn run_reboot_prep_command(label: &str, program: &str, args: &[&str], allow_failure: bool) {
+fn run_reboot_prep_command(
+    label: &str,
+    program: &str,
+    args: &[&str],
+    allow_failure: bool,
+) -> Option<String> {
     match Command::new(program).args(args).output() {
         Ok(output) if output.status.success() => {
             info!(step = label, "Safe OS reboot step completed");
+            None
         }
         Ok(output) => {
             let severity = if allow_failure {
@@ -2540,12 +2796,24 @@ fn run_reboot_prep_command(label: &str, program: &str, args: &[&str], allow_fail
                 "required"
             };
             warn_reboot_prep_failure(label, program, severity, &output);
+            if allow_failure {
+                None
+            } else {
+                Some(format!(
+                    "重启预处理步骤失败: {label}; command={program}; status={}",
+                    output.status
+                ))
+            }
         }
         Err(err) if allow_failure => {
             warn!(step = label, command = program, error = %err, "Optional safe OS reboot step failed");
+            None
         }
         Err(err) => {
             warn!(step = label, command = program, error = %err, "Safe OS reboot step failed");
+            Some(format!(
+                "重启预处理步骤失败: {label}; command={program}; error={err}"
+            ))
         }
     }
 }
@@ -2619,7 +2887,16 @@ fn warn_reboot_prep_failure(label: &str, program: &str, severity: &str, output: 
 
 // ============ 通知配置 ============
 
-pub async fn restart_service_handler() -> impl IntoResponse {
+pub async fn restart_service_handler(State(app): State<AppState>) -> impl IntoResponse {
+    app.system_event_emitter
+        .emit_code(
+            system_event_codes::SYSTEM_SERVICE_SIMADMIN_RESTART_REQUESTED,
+            system_event_severity::WARNING,
+            system_event_status::TRIGGERED,
+            "simadmin",
+            "用户触发 SimAdmin 服务重启",
+        )
+        .await;
     tokio::spawn(async move {
         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
         let _ = Command::new("systemctl")

@@ -48,7 +48,6 @@ const LOG_STATUS_OPTIONS = [
   { value: 'quiet_hours', label: '免打扰' },
   { value: 'unmatched', label: '未匹配规则' },
   { value: 'no_available_channel', label: '无可用通道' },
-  { value: 'threshold_waiting', label: '未达阈值' },
 ]
 
 const filterTextFieldSx = {
@@ -122,11 +121,10 @@ function monthGrid(monthDate: Date) {
 }
 
 function logSummaryText(log: NotificationLogEntry) {
-  if (log.status === 'failed' && log.message) return `${log.summary}；失败原因：${log.message}`
+  if (log.status === 'failed' && log.message) return `${log.summary}\n失败原因：${log.message}`
   if (log.status === 'quiet_hours' && log.message) return `${log.summary}；免打扰原因：${log.message}`
-  if (log.status === 'unmatched' && log.message) return `${log.summary}；未匹配规则原因：${log.message}`
+  if (log.status === 'unmatched' && log.message) return `${log.summary}\n未匹配规则原因：${log.message}`
   if (log.status === 'no_available_channel' && log.message) return `${log.summary}；无可用通道原因：${log.message}`
-  if (log.status === 'threshold_waiting' && log.message) return `${log.summary}；未达阈值原因：${log.message}`
   return log.summary
 }
 
@@ -488,14 +486,14 @@ export default function NotificationLogsTab({
                         ? 'primary.main'
                         : log.status === 'failed'
                           ? 'error.main'
-                          : log.status === 'quiet_hours' || log.status === 'threshold_waiting'
+                          : log.status === 'quiet_hours'
                             ? 'warning.main'
                             : 'text.secondary',
                     }}
                   >
                     {statusLabel(log.status)}
                   </TableCell>
-                  <TableCell sx={{ fontWeight: 400 }} title={summaryText}>{summaryText}</TableCell>
+                  <TableCell sx={{ fontWeight: 400, whiteSpace: 'pre-line' }} title={summaryText}>{summaryText}</TableCell>
                   <TableCell sx={{ fontWeight: 400 }}>{log.rule_name || '-'}</TableCell>
                   <TableCell sx={{ fontWeight: 400 }}>{log.channel_name || '-'}</TableCell>
                   </TableRow>

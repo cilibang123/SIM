@@ -289,6 +289,9 @@ impl DdnsManager {
             timestamp: now_string(),
             failure_count,
         };
+        if notification_sender.ddns_event_blocked_by_failure_threshold(&event) {
+            return;
+        }
         if let Err(err) = notification_sender.forward_ddns_event(&event).await {
             self.push_log(
                 "warn",

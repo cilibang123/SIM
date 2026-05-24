@@ -24,7 +24,7 @@ import {
   useMediaQuery,
 } from '@mui/material'
 import { alpha, type Theme } from '@mui/material/styles'
-import { Add, DeleteOutline, Dns, ExpandMore, Save, Sms, SystemUpdateAlt } from '@mui/icons-material'
+import { Add, DeleteOutline, Dns, ExpandMore, NotificationsActive, Save, Sms, SystemUpdateAlt } from '@mui/icons-material'
 import type {
   MatcherOperator,
   NotificationConfig,
@@ -41,11 +41,13 @@ import {
   createQuietSchedule,
   eventLabel,
 } from './notificationModel'
+import SystemEventRuleEditor from './SystemEventRuleEditor'
 
 const EVENT_ICONS: Record<NotificationEventType, typeof Sms> = {
   sms: Sms,
   ddns: Dns,
   version_update: SystemUpdateAlt,
+  system_event: NotificationsActive,
 }
 
 type NotificationRulesTabProps = {
@@ -171,6 +173,7 @@ export default function NotificationRulesTab({
                 {EVENT_TYPES.map((type) => {
                   const Icon = EVENT_ICONS[type.key]
                   const stats = ruleCountForType(type.key)
+                  const hasEnabledRule = stats.enabled > 0
                   return (
                     <ListItemButton
                       key={type.key}
@@ -181,8 +184,8 @@ export default function NotificationRulesTab({
                       <Avatar sx={{
                         width: 32,
                         height: 32,
-                        bgcolor: (theme: Theme) => selectedEventType === type.key ? alpha(theme.palette.primary.main, 0.12) : theme.palette.action.hover,
-                        color: selectedEventType === type.key ? 'primary.main' : 'text.secondary',
+                        bgcolor: (theme: Theme) => hasEnabledRule ? alpha(theme.palette.primary.main, 0.12) : theme.palette.action.hover,
+                        color: hasEnabledRule ? 'primary.main' : 'text.secondary',
                       }}>
                         <Icon fontSize="small" />
                       </Avatar>
@@ -269,30 +272,34 @@ export default function NotificationRulesTab({
                   </Box>
                 </AccordionSummary>
                 <AccordionDetails>
-                  <Box display="grid" gridTemplateColumns={{ xs: '1fr', md: '1fr 1fr' }} gap={2}>
+                  <Box display="grid" gridTemplateColumns={{ xs: '1fr', md: rule.type === 'system_event' ? '1fr' : '1fr 1fr' }} gap={2}>
                     <TextField label="规则名称" value={rule.name} onChange={(event: ChangeEvent<HTMLInputElement>) => onPatchRule(rule.id, { name: event.target.value })} />
-                    <TextField
-                      select
-                      label="匹配字段"
-                      value={rule.matcher.field}
-                      onChange={(event: ChangeEvent<HTMLInputElement>) => onPatchRule(rule.id, { matcher: { ...rule.matcher, field: event.target.value } })}
-                    >
-                      {MATCH_FIELDS[rule.type].map((field) => <MenuItem key={field.value} value={field.value}>{field.label}</MenuItem>)}
-                    </TextField>
-                    <TextField
-                      select
-                      label="匹配方式"
-                      value={rule.matcher.operator}
-                      onChange={(event: ChangeEvent<HTMLInputElement>) => onPatchRule(rule.id, { matcher: { ...rule.matcher, operator: event.target.value as MatcherOperator } })}
-                    >
-                      {MATCHER_OPERATORS.map((operator) => <MenuItem key={operator.value} value={operator.value}>{operator.label}</MenuItem>)}
-                    </TextField>
-                    <TextField
-                      label="匹配内容"
-                      value={rule.matcher.value}
-                      disabled={rule.matcher.operator === 'always'}
-                      onChange={(event: ChangeEvent<HTMLInputElement>) => onPatchRule(rule.id, { matcher: { ...rule.matcher, value: event.target.value } })}
-                    />
+                    {rule.type !== 'system_event' && (
+                      <>
+                        <TextField
+                          select
+                          label="匹配字段"
+                          value={rule.matcher.field}
+                          onChange={(event: ChangeEvent<HTMLInputElement>) => onPatchRule(rule.id, { matcher: { ...rule.matcher, field: event.target.value } })}
+                        >
+                          {MATCH_FIELDS[rule.type].map((field) => <MenuItem key={field.value} value={field.value}>{field.label}</MenuItem>)}
+                        </TextField>
+                        <TextField
+                          select
+                          label="匹配方式"
+                          value={rule.matcher.operator}
+                          onChange={(event: ChangeEvent<HTMLInputElement>) => onPatchRule(rule.id, { matcher: { ...rule.matcher, operator: event.target.value as MatcherOperator } })}
+                        >
+                          {MATCHER_OPERATORS.map((operator) => <MenuItem key={operator.value} value={operator.value}>{operator.label}</MenuItem>)}
+                        </TextField>
+                        <TextField
+                          label="匹配内容"
+                          value={rule.matcher.value}
+                          disabled={rule.matcher.operator === 'always'}
+                          onChange={(event: ChangeEvent<HTMLInputElement>) => onPatchRule(rule.id, { matcher: { ...rule.matcher, value: event.target.value } })}
+                        />
+                      </>
+                    )}
                   </Box>
 
                   {rule.type === 'ddns' && (
@@ -329,6 +336,13 @@ export default function NotificationRulesTab({
                         </Typography>
                       </Box>
                     </Box>
+                  )}
+
+                  {rule.type === 'system_event' && (
+                    <SystemEventRuleEditor
+                      eventCodes={rule.event_codes ?? []}
+                      onChange={(eventCodes) => onPatchRule(rule.id, { event_codes: eventCodes })}
+                    />
                   )}
 
                   <Box mt={2}>

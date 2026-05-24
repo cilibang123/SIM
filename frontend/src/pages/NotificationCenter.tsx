@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Alert,
   Box,
@@ -10,6 +10,7 @@ import {
 } from '@mui/material'
 import { NotificationsActive } from '@mui/icons-material'
 import { api } from '../api/current'
+import { useRefreshInterval } from '../contexts/RefreshContext'
 import type {
   NotificationChannelInstance,
   NotificationChannelKey,
@@ -40,6 +41,7 @@ type NotificationLogClearFilters = {
 }
 
 export default function NotificationCenterPage() {
+  const { refreshInterval, refreshKey } = useRefreshInterval()
   const [tab, setTab] = useState(0)
   const [config, setConfig] = useState<NotificationConfig>(() => createDefaultConfig())
   const [selectedChannelId, setSelectedChannelId] = useState<string>('')
@@ -59,6 +61,8 @@ export default function NotificationCenterPage() {
   const [testing, setTesting] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [success, setSuccess] = useState<string | null>(null)
+  const logsLoadingRef = useRef(false)
+  const lastRefreshKeyRef = useRef(refreshKey)
 
   const selectedChannel = useMemo(
     () => config.channels.find((channel) => channel.id === selectedChannelId) ?? config.channels[0],
@@ -80,8 +84,10 @@ export default function NotificationCenterPage() {
     }
   }, [])
 
-  const loadLogs = useCallback(async () => {
-    setLogsLoading(true)
+  const loadLogs = useCallback(async (silent = false) => {
+    if (logsLoadingRef.current) return
+    logsLoadingRef.current = true
+    if (!silent) setLogsLoading(true)
     try {
       const response = await api.getNotificationLogs({
         type: logType,
@@ -95,9 +101,10 @@ export default function NotificationCenterPage() {
       setLogs(response.data?.logs ?? [])
       setLogTotal(response.data?.total ?? 0)
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err))
+      if (!silent) setError(err instanceof Error ? err.message : String(err))
     } finally {
-      setLogsLoading(false)
+      logsLoadingRef.current = false
+      if (!silent) setLogsLoading(false)
     }
   }, [logEndDate, logPage, logQuery, logStartDate, logStatus, logType])
 
@@ -106,8 +113,24 @@ export default function NotificationCenterPage() {
   }, [loadConfig])
 
   useEffect(() => {
-    void loadLogs()
-  }, [loadLogs])
+    if (tab === 0) void loadLogs()
+  }, [loadLogs, tab])
+
+  useEffect(() => {
+    if (lastRefreshKeyRef.current === refreshKey) return
+    lastRefreshKeyRef.current = refreshKey
+    if (tab === 0) void loadLogs()
+  }, [loadLogs, refreshKey, tab])
+
+  useEffect(() => {
+    if (tab !== 0 || refreshInterval <= 0) return undefined
+
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === 'visible') void loadLogs(true)
+    }, refreshInterval)
+
+    return () => window.clearInterval(timer)
+  }, [loadLogs, refreshInterval, tab])
 
   useEffect(() => {
     const maxPage = Math.max(0, Math.ceil(logTotal / LOG_PAGE_SIZE) - 1)

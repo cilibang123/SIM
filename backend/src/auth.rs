@@ -19,7 +19,16 @@ use ring::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{config::SecurityConfig, db::Database, models::ApiResponse, state::AppState};
+use crate::{
+    config::SecurityConfig,
+    db::Database,
+    models::ApiResponse,
+    state::AppState,
+    system_event::{
+        codes as system_event_codes, severity as system_event_severity,
+        status as system_event_status,
+    },
+};
 
 const PASSWORD_KEY: &str = "admin_password_hash";
 const PASSWORD_ALGORITHM: &str = "pbkdf2_sha256";
@@ -434,11 +443,12 @@ pub async fn login(State(state): State<AppState>, Json(payload): Json<LoginReque
     match verify_password(&payload.password, &password_hash) {
         Ok(true) => {}
         Ok(false) => {
+            state.system_event_emitter.record_login_failure().await;
             return (
                 StatusCode::UNAUTHORIZED,
                 Json(ApiResponse::<Value>::error("管理员密码不正确")),
             )
-                .into_response()
+                .into_response();
         }
         Err(err) => {
             return (
@@ -524,6 +534,17 @@ pub async fn change_password(
             .into_response();
     }
 
+    state
+        .system_event_emitter
+        .emit_code(
+            system_event_codes::SECURITY_PASSWORD_CHANGED,
+            system_event_severity::WARNING,
+            system_event_status::CHANGED,
+            "admin",
+            "管理员密码已修改",
+        )
+        .await;
+
     response_with_session(
         ApiResponse::success_with_message("Password updated", Value::Null),
         &session.token,
@@ -553,6 +574,7 @@ pub async fn set_settings(
     headers: HeaderMap,
     Json(payload): Json<SecurityConfig>,
 ) -> Response {
+    let previous_settings = normalize_security_settings(state.config_manager.get_security());
     if let Err(err) = validate_security_settings(&payload) {
         return (
             StatusCode::BAD_REQUEST,
@@ -569,6 +591,30 @@ pub async fn set_settings(
             ))),
         )
             .into_response();
+    }
+
+    if previous_settings.password_protection_enabled && !settings.password_protection_enabled {
+        state
+            .system_event_emitter
+            .emit_code(
+                system_event_codes::SECURITY_PASSWORD_PROTECTION_DISABLED,
+                system_event_severity::CRITICAL,
+                system_event_status::CHANGED,
+                "security",
+                "密码保护已关闭",
+            )
+            .await;
+    } else if previous_settings != settings {
+        state
+            .system_event_emitter
+            .emit_code(
+                system_event_codes::SECURITY_POLICY_CHANGED,
+                system_event_severity::WARNING,
+                system_event_status::CHANGED,
+                "security",
+                "安全策略已变更",
+            )
+            .await;
     }
 
     let mut response = (

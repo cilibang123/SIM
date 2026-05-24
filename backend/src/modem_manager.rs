@@ -26,6 +26,10 @@ use crate::{
         RadioModeResponse, ServingCell, SetApnRequest, SignalStrengthResponse, SimInfoResponse,
     },
     serial::with_serial,
+    system_event::{
+        codes as system_event_codes, severity as system_event_severity,
+        status as system_event_status, SystemEventEmitter,
+    },
 };
 
 const MM_SERVICE: &str = "org.freedesktop.ModemManager1";
@@ -5905,6 +5909,7 @@ pub async fn data_connection_watchdog(
     user_disabled: std::sync::Arc<AtomicBool>,
     airplane_requested: std::sync::Arc<AtomicBool>,
     config: std::sync::Arc<ConfigManager>,
+    system_events: std::sync::Arc<SystemEventEmitter>,
 ) {
     use crate::iptables::get_iptables_rule_count;
 
@@ -5912,12 +5917,15 @@ pub async fn data_connection_watchdog(
     let mut iptables_rules_logged = false;
     let mut missing_count = 0u32;
     let mut scan_requested_for_outage = false;
+    let mut modem_outage_reported = false;
     let mut last_modem_restart_at: Option<Instant> = None;
     let mut searching_count = 0u32;
     let mut auto_register_requested_for_search = false;
     let mut last_searching_recovery_at: Option<Instant> = None;
     let mut last_data_activation_attempt_at: Option<Instant> = None;
     let mut transition_stuck_count = 0u32;
+    let mut cellular_problem_active = false;
+    let mut data_activation_failure_active = false;
     const TRANSITION_STUCK_THRESHOLD: u32 = 6;
 
     loop {
@@ -5952,6 +5960,18 @@ pub async fn data_connection_watchdog(
         let result = match find_modem_path(&conn).await {
             Ok(modem_path) => match get_property(&conn, &modem_path, MM_MODEM, "State").await {
                 Ok(value) => {
+                    if modem_outage_reported {
+                        system_events
+                            .emit_code(
+                                system_event_codes::BASEBAND_MODEM_RECOVERED,
+                                system_event_severity::INFO,
+                                system_event_status::RECOVERED,
+                                modem_path.to_string(),
+                                "Modem 已重新出现在 ModemManager 中",
+                            )
+                            .await;
+                        modem_outage_reported = false;
+                    }
                     missing_count = 0;
                     scan_requested_for_outage = false;
                     let state = extract_i32(&value);
@@ -5976,7 +5996,19 @@ pub async fn data_connection_watchdog(
                     } else if state == 6 {
                         match set_modem_enabled(&conn, &modem_path, false).await {
                             Ok(_) => match set_modem_enabled(&conn, &modem_path, true).await {
-                                Ok(_) => "Modem enabled but idle, cycled radio state".to_string(),
+                                Ok(_) => {
+                                    cellular_problem_active = true;
+                                    system_events
+                                        .emit_code(
+                                            system_event_codes::CELLULAR_RADIO_CYCLE_TRIGGERED,
+                                            system_event_severity::WARNING,
+                                            system_event_status::TRIGGERED,
+                                            modem_path.to_string(),
+                                            "Modem enabled but idle, watchdog cycled radio state",
+                                        )
+                                        .await;
+                                    "Modem enabled but idle, cycled radio state".to_string()
+                                }
                                 Err(err) => {
                                     format!("Modem enabled but idle, re-enable failed: {err}")
                                 }
@@ -6003,6 +6035,16 @@ pub async fn data_connection_watchdog(
                                     tokio::time::sleep(Duration::from_secs(3)).await;
                                     match set_modem_enabled(&conn, &modem_path, true).await {
                                         Ok(_) => {
+                                            cellular_problem_active = true;
+                                            system_events
+                                                .emit_code(
+                                                    system_event_codes::CELLULAR_RADIO_CYCLE_TRIGGERED,
+                                                    system_event_severity::WARNING,
+                                                    system_event_status::TRIGGERED,
+                                                    modem_path.to_string(),
+                                                    "长时间 searching，watchdog 已循环射频状态",
+                                                )
+                                                .await;
                                             "Searching for too long, cycled radio state".to_string()
                                         }
                                         Err(err) => {
@@ -6020,9 +6062,33 @@ pub async fn data_connection_watchdog(
                             && !auto_register_requested_for_search
                         {
                             auto_register_requested_for_search = true;
+                            cellular_problem_active = true;
+                            system_events
+                                .emit_code(
+                                    system_event_codes::CELLULAR_SEARCHING_THRESHOLD,
+                                    system_event_severity::WARNING,
+                                    system_event_status::TRIGGERED,
+                                    modem_path.to_string(),
+                                    format!(
+                                        "蜂窝网络长时间 searching，registration={}",
+                                        mm_registration_to_string(registration)
+                                    ),
+                                )
+                                .await;
                             match register_operator_auto(&conn).await {
-                                Ok(_) => "Searching for too long, requested automatic registration"
-                                    .to_string(),
+                                Ok(_) => {
+                                    system_events
+                                        .emit_code(
+                                            system_event_codes::CELLULAR_AUTO_REGISTER_TRIGGERED,
+                                            system_event_severity::WARNING,
+                                            system_event_status::TRIGGERED,
+                                            modem_path.to_string(),
+                                            "长时间 searching，已触发自动驻网",
+                                        )
+                                        .await;
+                                    "Searching for too long, requested automatic registration"
+                                        .to_string()
+                                }
                                 Err(err) => format!(
                                     "Searching for too long, automatic registration failed: {err}"
                                 ),
@@ -6047,6 +6113,19 @@ pub async fn data_connection_watchdog(
                         )
                     } else if state >= MM_MODEM_STATE_CONNECTED {
                         last_data_activation_attempt_at = None;
+                        data_activation_failure_active = false;
+                        if cellular_problem_active {
+                            system_events
+                                .emit_code(
+                                    system_event_codes::CELLULAR_CONNECTION_RECOVERED,
+                                    system_event_severity::INFO,
+                                    system_event_status::RECOVERED,
+                                    modem_path.to_string(),
+                                    "蜂窝数据连接已恢复",
+                                )
+                                .await;
+                            cellular_problem_active = false;
+                        }
                         "Connected".to_string()
                     } else if data_connection_transition_in_progress(state) {
                         transition_stuck_count += 1;
@@ -6060,7 +6139,22 @@ pub async fn data_connection_watchdog(
                                 Ok(_) => {
                                     tokio::time::sleep(Duration::from_secs(3)).await;
                                     match set_modem_enabled(&conn, &modem_path, true).await {
-                                        Ok(_) => "Transition stuck, cycled radio state".to_string(),
+                                        Ok(_) => {
+                                            cellular_problem_active = true;
+                                            system_events
+                                                .emit_code(
+                                                    system_event_codes::CELLULAR_RADIO_CYCLE_TRIGGERED,
+                                                    system_event_severity::WARNING,
+                                                    system_event_status::TRIGGERED,
+                                                    modem_path.to_string(),
+                                                    format!(
+                                                        "数据连接状态卡住，已循环射频状态: {}",
+                                                        mm_state_to_string(state)
+                                                    ),
+                                                )
+                                                .await;
+                                            "Transition stuck, cycled radio state".to_string()
+                                        }
                                         Err(err) => {
                                             format!("Transition stuck, re-enable failed: {err}")
                                         }
@@ -6103,7 +6197,22 @@ pub async fn data_connection_watchdog(
                             .await
                             {
                                 Ok(_) => "Connection activation requested".to_string(),
-                                Err(err) => format!("Activation failed: {err}"),
+                                Err(err) => {
+                                    cellular_problem_active = true;
+                                    if !data_activation_failure_active {
+                                        system_events
+                                            .emit_code(
+                                                system_event_codes::CELLULAR_ACTIVATION_FAILED,
+                                                system_event_severity::WARNING,
+                                                system_event_status::FAILED,
+                                                modem_path.to_string(),
+                                                format!("蜂窝数据连接激活失败: {err}"),
+                                            )
+                                            .await;
+                                        data_activation_failure_active = true;
+                                    }
+                                    format!("Activation failed: {err}")
+                                }
                             }
                         }
                     }
@@ -6120,6 +6229,18 @@ pub async fn data_connection_watchdog(
                     match run_recovery_command("mmcli", &["--scan-modems"]).await {
                         Ok(output) => {
                             scan_requested_for_outage = true;
+                            system_events
+                                .emit_code(
+                                    system_event_codes::BASEBAND_SCAN_MODEMS_TRIGGERED,
+                                    system_event_severity::INFO,
+                                    system_event_status::TRIGGERED,
+                                    "ModemManager",
+                                    format!(
+                                        "连续 {} 次未找到 Modem，已触发 mmcli --scan-modems",
+                                        missing_count
+                                    ),
+                                )
+                                .await;
                             info!(
                                 failures = missing_count,
                                 output = %output,
@@ -6137,15 +6258,45 @@ pub async fn data_connection_watchdog(
                 }
 
                 if missing_count >= MODEM_RESTART_THRESHOLD && !cooldown_active {
+                    if !modem_outage_reported {
+                        system_events
+                            .emit_code(
+                                system_event_codes::BASEBAND_MODEM_MISSING_THRESHOLD,
+                                system_event_severity::CRITICAL,
+                                system_event_status::TRIGGERED,
+                                "ModemManager",
+                                format!("连续 {} 次未找到 Modem", missing_count),
+                            )
+                            .await;
+                        modem_outage_reported = true;
+                    }
                     match run_recovery_command("systemctl", &["restart", "ModemManager"]).await {
                         Ok(_) => {
                             last_modem_restart_at = Some(Instant::now());
                             missing_count = 0;
                             scan_requested_for_outage = false;
+                            system_events
+                                .emit_code(
+                                    system_event_codes::BASEBAND_MODEMMANAGER_RESTARTED,
+                                    system_event_severity::WARNING,
+                                    system_event_status::TRIGGERED,
+                                    "ModemManager",
+                                    "watchdog 已重启 ModemManager",
+                                )
+                                .await;
                             info!("Watchdog: restarted ModemManager after repeated modem loss");
                             "Modem unavailable, restarting ModemManager".to_string()
                         }
                         Err(restart_err) => {
+                            system_events
+                                .emit_code(
+                                    system_event_codes::BASEBAND_MODEMMANAGER_RESTART_FAILED,
+                                    system_event_severity::CRITICAL,
+                                    system_event_status::FAILED,
+                                    "ModemManager",
+                                    format!("watchdog 重启 ModemManager 失败: {restart_err}"),
+                                )
+                                .await;
                             warn!(
                                 failures = missing_count,
                                 error = %restart_err,

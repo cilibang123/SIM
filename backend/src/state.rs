@@ -16,6 +16,7 @@ use crate::device_network::DdnsManager;
 use crate::esim::EsimSupervisor;
 use crate::notification::NotificationSender;
 use crate::sms_listener::SmsResyncHandle;
+use crate::system_event::SystemEventEmitter;
 
 #[derive(Clone)]
 pub struct ActiveCallRecord {
@@ -37,6 +38,7 @@ pub struct AppState {
     pub config_manager: Arc<ConfigManager>,
     /// 通知发送器（用于转发 SMS、通话和 DDNS 通知）
     pub notification_sender: Arc<NotificationSender>,
+    pub system_event_emitter: Arc<SystemEventEmitter>,
     pub ddns_manager: Arc<DdnsManager>,
     pub esim_supervisor: Arc<EsimSupervisor>,
     pub sms_resync: SmsResyncHandle,
@@ -58,6 +60,7 @@ impl AppState {
         database: Arc<Database>,
         config_manager: Arc<ConfigManager>,
         notification_sender: Arc<NotificationSender>,
+        system_event_emitter: Arc<SystemEventEmitter>,
         ddns_manager: Arc<DdnsManager>,
         esim_supervisor: Arc<EsimSupervisor>,
         sms_resync: SmsResyncHandle,
@@ -70,6 +73,7 @@ impl AppState {
             database,
             config_manager,
             notification_sender,
+            system_event_emitter,
             ddns_manager,
             esim_supervisor,
             sms_resync,
@@ -107,6 +111,12 @@ impl FromRef<AppState> for Arc<ConfigManager> {
 impl FromRef<AppState> for Arc<NotificationSender> {
     fn from_ref(state: &AppState) -> Self {
         state.notification_sender.clone()
+    }
+}
+
+impl FromRef<AppState> for Arc<SystemEventEmitter> {
+    fn from_ref(state: &AppState) -> Self {
+        state.system_event_emitter.clone()
     }
 }
 

@@ -39,6 +39,8 @@ mod ota;
 mod serial;
 mod sms_listener;
 mod state;
+mod system_event;
+mod system_event_monitor;
 mod utils;
 
 use config::{get_default_config_path, ConfigManager};
@@ -49,6 +51,10 @@ use handlers::*;
 use modem_manager::{ensure_nm_modem_profile, init_data_connection};
 use notification::NotificationSender;
 use state::AppState;
+use system_event::{
+    codes as system_event_codes, severity as system_event_severity, status as system_event_status,
+    SystemEventEmitter,
+};
 
 /// 获取二进制文件同级目录下的 www 目录路径
 fn get_www_dir() -> PathBuf {
@@ -326,8 +332,13 @@ async fn main() -> Result<()> {
         Arc::clone(&dbus_conn),
         Arc::clone(&app_db),
     ));
+    let system_event_emitter = Arc::new(SystemEventEmitter::new(Arc::clone(&notification_sender)));
     let (sms_resync, sms_resync_rx) = sms_listener::sms_resync_channel();
     let ddns_manager = Arc::new(DdnsManager::new());
+    system_event_monitor::spawn_system_event_monitor(
+        Arc::clone(&system_event_emitter),
+        Arc::clone(&dbus_conn),
+    );
 
     {
         let ddns_manager_clone = Arc::clone(&ddns_manager);
@@ -418,6 +429,7 @@ async fn main() -> Result<()> {
         let user_off = Arc::clone(&data_user_disabled);
         let airplane_requested = Arc::clone(&airplane_mode_requested);
         let cfg = Arc::clone(&config_manager);
+        let system_events = Arc::clone(&system_event_emitter);
         tokio::spawn(async move {
             // 初始延迟 5 秒，等待系统稳定
             tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
@@ -428,10 +440,21 @@ async fn main() -> Result<()> {
                 user_off,
                 airplane_requested,
                 cfg,
+                system_events,
             )
             .await;
         });
     }
+
+    system_event_emitter
+        .emit_code(
+            system_event_codes::SYSTEM_SERVICE_STARTED,
+            system_event_severity::INFO,
+            system_event_status::SUCCEEDED,
+            "simadmin",
+            "SimAdmin 服务启动完成",
+        )
+        .await;
 
     // CORS 配置：允许前端开发服务器跨域访问
     let cors = CorsLayer::new()
@@ -445,6 +468,7 @@ async fn main() -> Result<()> {
         app_db,
         config_manager,
         notification_sender,
+        system_event_emitter,
         ddns_manager,
         Arc::clone(&esim_supervisor),
         sms_resync,

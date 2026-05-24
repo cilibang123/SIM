@@ -46,7 +46,11 @@
 	<br/><br/>
 	<img src="./static/SMS.png" width="100%" alt="SMS" />
 	<br/><br/>
-	<img src="./static/Notification.png" width="100%" alt="Notification" />
+	<img src="./static/NotificationLogs.png" width="100%" alt="NotificationLogs" />
+	<br/><br/>
+	<img src="./static/NotificationRules.png" width="100%" alt="NotificationRules" />
+	<br/><br/>
+	<img src="./static/NotificationChannels.png" width="100%" alt="NotificationChannels" />
 	<br/><br/>
 	<img src="./static/Basic_Configuration.png" width="100%" alt="Basic_Configuration" />
 	<br/><br/>
@@ -111,7 +115,6 @@ SimAdmin 是一套面向 Debian 蜂窝 CPE、随身 WiFi、软路由类设备的
   <thead>
     <tr>
       <th width="50%">QQ 群</th>
-      <th width="50%">微信群</th>
     </tr>
   </thead>
   <tbody>
@@ -121,13 +124,6 @@ SimAdmin 是一套面向 Debian 蜂窝 CPE、随身 WiFi、软路由类设备的
           <source media="(prefers-color-scheme: dark)" srcset="./static/Community/Community_QQ_Dark.png" />
           <source media="(prefers-color-scheme: light)" srcset="./static/Community/Community_QQ_Light.png" />
           <img src="./static/Community/Community_QQ_Light.png" />
-        </picture>
-      </td>
-      <td>
-        <picture>
-          <source media="(prefers-color-scheme: dark)" srcset="https://raw.giteeusercontent.com/v2599/Notify/raw/simadmin/Community_Wechat_Dark.png" />
-          <source media="(prefers-color-scheme: light)" srcset="https://raw.giteeusercontent.com/v2599/Notify/raw/simadmin/Community_Wechat_Light.png" />
-          <img src="https://raw.giteeusercontent.com/v2599/Notify/raw/simadmin/Community_Wechat_Light.png" />
         </picture>
       </td>
     </tr>
@@ -445,6 +441,7 @@ journalctl -u simadmin -f
 - 转发日志新增分页、多维度筛选及清空功能，细化状态分类，提升转发链路问题排查效率。
 - 转发日志增强时间范围筛选、高级清理和自动清理配置，支持按类型、状态、时间段及保留策略管理日志。
 - DDNS 转发规则新增连续失败推送阈值，支持达到指定失败次数后再推送，减少短时网络波动造成的通知干扰。
+- 通知中心新增系统事件通知，覆盖基带、蜂窝网络、设备网络、系统/服务、安全审计、SIM/eSIM 和资源告警，支持按事件独立启停、阈值/恢复推送及系统事件模板。
 
 #### 💫 体验优化
 
@@ -964,7 +961,9 @@ busctl introspect org.freedesktop.ModemManager1 /org/freedesktop/ModemManager1/M
 - 转发规则按短信、DDNS、版本更新和系统事件路由；短信/DDNS/版本更新支持内容匹配，系统事件按具体事件码独立启用/停用。
 - 转发日志按单个通道发送结果记录，状态包括成功、失败、免打扰、未匹配规则和无可用通道。
 
-模板变量包括本机号码、短信号码、短信内容、短信方向、短信状态和时间等字段。版本更新模板支持固件包名、版本号、Commit、构建时间和 OTA 包 MD5；构建时间会按北京时间展示。
+系统事件覆盖基带、蜂窝网络、设备网络、系统/服务、安全审计、SIM/eSIM 和资源告警。默认开启高价值低噪音事件，例如 Modem 丢失/恢复、蜂窝连接失败/恢复、系统重启请求、安全策略变更、eSIM 失败事件、CPU/内存/磁盘/温度/IPv4 连通性阈值和恢复；默认关闭 WLAN 连接/断开、服务启动完成、成功登录、lpac/Profile 成功类提示、IPv6 连通性和接口错误包增长等容易产生噪音的事件。
+
+模板变量包括本机号码、短信号码、短信内容、短信方向、短信状态和时间等字段。系统事件模板支持 `{{分类}}`、`{{事件}}`、`{{等级}}`、`{{状态}}`、`{{对象}}`、`{{消息}}`、`{{时间}}`；版本更新模板支持固件包名、版本号、Commit、构建时间和 OTA 包 MD5；构建时间会按北京时间展示。
 
 ### OTA 更新
 

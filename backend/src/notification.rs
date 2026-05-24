@@ -8,6 +8,7 @@ use crate::config::{
 use crate::db::{CallRecord, Database, SmsMessage};
 use crate::models::{DdnsEvent, VersionUpdateEvent};
 use crate::modem_manager::get_sim_info_data_with_cache;
+use crate::system_event::SystemEvent;
 use base64::{engine::general_purpose, Engine as _};
 use chrono::{DateTime, Datelike, FixedOffset, NaiveDateTime, Timelike, Utc};
 use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
@@ -74,6 +75,7 @@ enum NotificationEvent<'a> {
     },
     Ddns(&'a DdnsEvent),
     VersionUpdate(&'a VersionUpdateEvent),
+    SystemEvent(&'a SystemEvent),
 }
 
 impl NotificationEvent<'_> {
@@ -82,14 +84,18 @@ impl NotificationEvent<'_> {
             NotificationEvent::Sms { .. } => NotificationEventType::Sms,
             NotificationEvent::Ddns(_) => NotificationEventType::Ddns,
             NotificationEvent::VersionUpdate(_) => NotificationEventType::VersionUpdate,
+            NotificationEvent::SystemEvent(_) => NotificationEventType::SystemEvent,
         }
     }
 
-    fn title(&self) -> &'static str {
+    fn title(&self) -> String {
         match self {
-            NotificationEvent::Sms { .. } => "SimAdmin 短信通知",
-            NotificationEvent::Ddns(_) => "SimAdmin DDNS 通知",
-            NotificationEvent::VersionUpdate(_) => "SimAdmin 版本更新",
+            NotificationEvent::Sms { .. } => "SimAdmin 短信通知".to_string(),
+            NotificationEvent::Ddns(_) => "SimAdmin DDNS 通知".to_string(),
+            NotificationEvent::VersionUpdate(_) => "SimAdmin 版本更新".to_string(),
+            NotificationEvent::SystemEvent(event) => {
+                format!("SimAdmin 系统事件 - {}", event.event_label)
+            }
         }
     }
 
@@ -107,6 +113,10 @@ impl NotificationEvent<'_> {
             NotificationEvent::VersionUpdate(event) => compact_summary(&format!(
                 "{} {} {}",
                 event.version, event.asset_name, event.commit
+            )),
+            NotificationEvent::SystemEvent(event) => compact_summary(&format!(
+                "{} {} {}",
+                event.event_label, event.status_label, event.message
             )),
         }
     }
@@ -140,6 +150,19 @@ impl NotificationEvent<'_> {
                 "md5" => event.md5.clone(),
                 _ => self.summary(),
             },
+            NotificationEvent::SystemEvent(event) => match field {
+                "category" => event.category.clone(),
+                "category_label" => event.category_label.clone(),
+                "event_code" => event.event_code.clone(),
+                "event_label" => event.event_label.clone(),
+                "severity" => event.severity.clone(),
+                "severity_label" => event.severity_label.clone(),
+                "status" => event.status.clone(),
+                "status_label" => event.status_label.clone(),
+                "entity" => event.entity.clone(),
+                "message" => event.message.clone(),
+                _ => self.summary(),
+            },
         }
     }
 
@@ -156,6 +179,9 @@ impl NotificationEvent<'_> {
             NotificationEvent::Ddns(event) => render_ddns_template(&template, event, false),
             NotificationEvent::VersionUpdate(event) => {
                 render_version_update_template(&template, event, false)
+            }
+            NotificationEvent::SystemEvent(event) => {
+                render_system_event_template(&template, event, false)
             }
         }
     }
@@ -274,6 +300,18 @@ impl NotificationSender {
         })
     }
 
+    pub fn system_event_enabled(&self, event_code: &str) -> bool {
+        let config = self.get_config();
+        config.rules.iter().any(|rule| {
+            rule.enabled
+                && rule.event_type == NotificationEventType::SystemEvent
+                && rule
+                    .event_codes
+                    .iter()
+                    .any(|enabled_code| enabled_code == event_code)
+        })
+    }
+
     /// Forward a newly available version update to enabled channels.
     pub async fn forward_version_update_event(
         &self,
@@ -287,6 +325,17 @@ impl NotificationSender {
                 delivered: result.delivered,
                 errors: result.errors,
             })
+        } else {
+            Err(result.errors.join("; "))
+        }
+    }
+
+    pub async fn forward_system_event(&self, event: &SystemEvent) -> Result<(), String> {
+        let event = NotificationEvent::SystemEvent(event);
+        let result = self.route_event(&event).await;
+
+        if result.errors.is_empty() || result.delivered {
+            Ok(())
         } else {
             Err(result.errors.join("; "))
         }
@@ -336,15 +385,7 @@ impl NotificationSender {
             }
             matched_rules += 1;
 
-            if let Some(message) = ddns_failure_threshold_waiting(rule, event) {
-                self.record_notification_log(
-                    event.event_type(),
-                    "threshold_waiting",
-                    &summary,
-                    Some(rule),
-                    None,
-                    &message,
-                );
+            if ddns_failure_threshold_pending(rule, event) {
                 continue;
             }
 
@@ -401,10 +442,8 @@ impl NotificationSender {
                     continue;
                 }
 
-                match self
-                    .send_text_to_channel(channel, event.title(), &text)
-                    .await
-                {
+                let title = event.title();
+                match self.send_text_to_channel(channel, &title, &text).await {
                     Ok(message) => {
                         result.delivered = true;
                         self.record_notification_log(
@@ -432,7 +471,7 @@ impl NotificationSender {
             }
         }
 
-        if matched_rules == 0 {
+        if matched_rules == 0 && event.event_type() != NotificationEventType::SystemEvent {
             self.record_notification_log(
                 event.event_type(),
                 "unmatched",
@@ -495,6 +534,28 @@ impl NotificationSender {
                 warn!(error = %err, "Failed to auto cleanup notification logs");
             }
         }
+    }
+
+    pub fn ddns_event_blocked_by_failure_threshold(&self, event: &DdnsEvent) -> bool {
+        let config = self.get_config();
+        let event = NotificationEvent::Ddns(event);
+        let mut matched_rules = 0usize;
+
+        for rule in config
+            .rules
+            .iter()
+            .filter(|rule| rule.enabled && rule.event_type == NotificationEventType::Ddns)
+        {
+            if !rule_matches(rule, &event) {
+                continue;
+            }
+            matched_rules += 1;
+            if !ddns_failure_threshold_pending(rule, &event) {
+                return false;
+            }
+        }
+
+        matched_rules > 0
     }
 
     async fn send_text_to_channel(
@@ -1709,6 +1770,13 @@ where
 }
 
 fn rule_matches(rule: &NotificationRule, event: &NotificationEvent<'_>) -> bool {
+    if let NotificationEvent::SystemEvent(system_event) = event {
+        return rule
+            .event_codes
+            .iter()
+            .any(|event_code| event_code == &system_event.event_code);
+    }
+
     let value = event.field_value(rule.matcher.field.as_str());
     let expected = rule.matcher.value.trim();
     match rule.matcher.operator {
@@ -1732,35 +1800,21 @@ fn rule_matches(rule: &NotificationRule, event: &NotificationEvent<'_>) -> bool 
     }
 }
 
-fn ddns_failure_threshold_waiting(
-    rule: &NotificationRule,
-    event: &NotificationEvent<'_>,
-) -> Option<String> {
+fn ddns_failure_threshold_pending(rule: &NotificationRule, event: &NotificationEvent<'_>) -> bool {
     let NotificationEvent::Ddns(ddns) = event else {
-        return None;
+        return false;
     };
     if ddns.status != "failed" {
-        return None;
+        return false;
     }
 
     let threshold = rule.ddns_failure_threshold.max(1);
     if threshold <= 1 {
-        return None;
+        return false;
     }
 
     let failure_count = ddns.failure_count;
-    if failure_count > 0 && failure_count % threshold == 0 {
-        return None;
-    }
-
-    let next_threshold = if failure_count == 0 {
-        threshold
-    } else {
-        ((failure_count / threshold) + 1).saturating_mul(threshold)
-    };
-    Some(format!(
-        "DDNS 连续失败 {failure_count} 次，下一次推送阈值为 {next_threshold} 次"
-    ))
+    failure_count == 0 || failure_count % threshold != 0
 }
 
 fn quiet_hours_active(schedules: &[QuietHoursSchedule]) -> bool {
@@ -1814,6 +1868,7 @@ fn notification_event_type_key(event_type: NotificationEventType) -> &'static st
         NotificationEventType::Sms => "sms",
         NotificationEventType::Ddns => "ddns",
         NotificationEventType::VersionUpdate => "version_update",
+        NotificationEventType::SystemEvent => "system_event",
     }
 }
 
@@ -2055,6 +2110,53 @@ fn render_version_update_template(
         .replace("{{前端MD5}}", &frontend_md5)
         .replace("{{发布地址}}", &release_url)
         .replace("{{发布时间}}", &timestamp)
+}
+
+fn render_system_event_template(template: &str, event: &SystemEvent, escape_json: bool) -> String {
+    let maybe_escape = |value: &str| {
+        if escape_json {
+            escape_json_string(value)
+        } else {
+            value.to_string()
+        }
+    };
+    let category = maybe_escape(&event.category);
+    let category_label = maybe_escape(&event.category_label);
+    let event_code = maybe_escape(&event.event_code);
+    let event_label = maybe_escape(&event.event_label);
+    let severity = maybe_escape(&event.severity);
+    let severity_label = maybe_escape(&event.severity_label);
+    let status = maybe_escape(&event.status);
+    let status_label = maybe_escape(&event.status_label);
+    let entity = maybe_escape(&event.entity);
+    let message = maybe_escape(&event.message);
+    let timestamp_value = format_notification_time(&event.timestamp);
+    let timestamp = maybe_escape(&timestamp_value);
+
+    template
+        .replace("{{category}}", &category)
+        .replace("{{category_label}}", &category_label)
+        .replace("{{event_code}}", &event_code)
+        .replace("{{event_label}}", &event_label)
+        .replace("{{severity}}", &severity)
+        .replace("{{severity_label}}", &severity_label)
+        .replace("{{status}}", &status)
+        .replace("{{status_label}}", &status_label)
+        .replace("{{entity}}", &entity)
+        .replace("{{message}}", &message)
+        .replace("{{timestamp}}", &timestamp)
+        .replace("{{time}}", &timestamp)
+        .replace("{{分类}}", &category_label)
+        .replace("{{分类编码}}", &category)
+        .replace("{{事件}}", &event_label)
+        .replace("{{事件编码}}", &event_code)
+        .replace("{{等级}}", &severity_label)
+        .replace("{{等级编码}}", &severity)
+        .replace("{{状态}}", &status_label)
+        .replace("{{状态编码}}", &status)
+        .replace("{{对象}}", &entity)
+        .replace("{{消息}}", &message)
+        .replace("{{时间}}", &timestamp)
 }
 
 fn robot_webhook_url(webhook_url: &str, key: &str, prefix: &str) -> Result<String, String> {
@@ -2407,6 +2509,7 @@ mod tests {
                 value: "code".to_string(),
             },
             channel_ids: Vec::new(),
+            event_codes: Vec::new(),
             template: String::new(),
             quiet_hours: Vec::new(),
             ddns_failure_threshold: 1,
@@ -2433,6 +2536,7 @@ mod tests {
             enabled: true,
             matcher: RuleMatcher::default(),
             channel_ids: Vec::new(),
+            event_codes: Vec::new(),
             template: String::new(),
             quiet_hours: Vec::new(),
             ddns_failure_threshold: 5,
@@ -2444,24 +2548,24 @@ mod tests {
         };
 
         let event = NotificationEvent::Ddns(&ddns);
-        assert!(ddns_failure_threshold_waiting(&rule, &event).is_some());
+        assert!(ddns_failure_threshold_pending(&rule, &event));
 
         ddns.failure_count = 5;
         let event = NotificationEvent::Ddns(&ddns);
-        assert!(ddns_failure_threshold_waiting(&rule, &event).is_none());
+        assert!(!ddns_failure_threshold_pending(&rule, &event));
 
         ddns.failure_count = 6;
         let event = NotificationEvent::Ddns(&ddns);
-        assert!(ddns_failure_threshold_waiting(&rule, &event).is_some());
+        assert!(ddns_failure_threshold_pending(&rule, &event));
 
         ddns.failure_count = 10;
         let event = NotificationEvent::Ddns(&ddns);
-        assert!(ddns_failure_threshold_waiting(&rule, &event).is_none());
+        assert!(!ddns_failure_threshold_pending(&rule, &event));
 
         ddns.status = "updated".to_string();
         ddns.failure_count = 1;
         let event = NotificationEvent::Ddns(&ddns);
-        assert!(ddns_failure_threshold_waiting(&rule, &event).is_none());
+        assert!(!ddns_failure_threshold_pending(&rule, &event));
     }
 
     #[test]

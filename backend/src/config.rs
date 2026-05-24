@@ -242,6 +242,7 @@ pub enum NotificationEventType {
     Sms,
     Ddns,
     VersionUpdate,
+    SystemEvent,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -310,6 +311,8 @@ pub struct NotificationRule {
     pub matcher: RuleMatcher,
     #[serde(default)]
     pub channel_ids: Vec<String>,
+    #[serde(default)]
+    pub event_codes: Vec<String>,
     #[serde(default)]
     pub template: String,
     #[serde(default)]
@@ -435,7 +438,7 @@ pub struct VersionUpdateNotificationConfig {
     pub last_notified_version: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct SecurityConfig {
     #[serde(default = "default_true")]
@@ -979,6 +982,7 @@ fn push_legacy_rule(
             NotificationEventType::Sms => channel.forward_sms,
             NotificationEventType::Ddns => channel.forward_ddns,
             NotificationEventType::VersionUpdate => channel.forward_updates,
+            NotificationEventType::SystemEvent => false,
         })
         .collect::<Vec<_>>();
     if selected.is_empty() {
@@ -991,6 +995,7 @@ fn push_legacy_rule(
             NotificationEventType::Sms => channel.sms_template.clone(),
             NotificationEventType::Ddns => channel.ddns_template.clone(),
             NotificationEventType::VersionUpdate => channel.update_template.clone(),
+            NotificationEventType::SystemEvent => String::new(),
         })
         .unwrap_or_else(|| default_rule_template(event_type));
 
@@ -1004,6 +1009,7 @@ fn push_legacy_rule(
             .into_iter()
             .map(|channel| channel.id.clone())
             .collect(),
+        event_codes: Vec::new(),
         template,
         quiet_hours: Vec::new(),
         ddns_failure_threshold: default_ddns_failure_threshold(),
@@ -1047,6 +1053,9 @@ pub fn default_rule_template(event_type: NotificationEventType) -> String {
         }
         NotificationEventType::VersionUpdate => {
             "发现新版本\n固件包: {{固件包}}\n版本号: {{版本号}}\nCommit: {{Commit}}\n构建时间: {{构建时间}}\nMD5: {{MD5}}".to_string()
+        }
+        NotificationEventType::SystemEvent => {
+            "系统事件通知\n分类: {{分类}}\n事件: {{事件}}\n等级: {{等级}}\n状态: {{状态}}\n对象: {{对象}}\n消息: {{消息}}\n时间: {{时间}}".to_string()
         }
     }
 }

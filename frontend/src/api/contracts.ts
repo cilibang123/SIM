@@ -567,8 +567,8 @@ export type NotificationChannelKey =
   | 'feishu_robot'
   | 'telegram'
 
-export type NotificationEventType = 'sms' | 'ddns' | 'version_update'
-export type NotificationLogStatus = 'success' | 'failed' | 'no_available_channel' | 'quiet_hours' | 'unmatched' | 'threshold_waiting'
+export type NotificationEventType = 'sms' | 'ddns' | 'version_update' | 'system_event'
+export type NotificationLogStatus = 'success' | 'failed' | 'no_available_channel' | 'quiet_hours' | 'unmatched'
 export type MatcherOperator = 'always' | 'contains' | 'not_contains' | 'equals' | 'regex'
 
 export interface MessageChannelConfig {
@@ -693,6 +693,7 @@ export interface NotificationRule {
   enabled: boolean
   matcher: RuleMatcher
   channel_ids: string[]
+  event_codes: string[]
   template: string
   quiet_hours: QuietHoursSchedule[]
   ddns_failure_threshold: number
@@ -719,7 +720,7 @@ export interface NotificationLogsResponse {
 export const DEFAULT_SMS_TEMPLATE = `{
   "msg_type": "text",
   "content": {
-    "text": "📱 短信通知\\n发送方: {{phone_number}}\\n内容: {{content}}\\n时间: {{timestamp}}\\n本机号码: {{own_number}}"
+    "text": "📱 短信通知\\n号码: {{phone_number}}\\n内容: {{content}}\\n时间: {{timestamp}}\\n来源: {{own_number}}"
   }
 }`
 
@@ -745,10 +746,10 @@ export const DEFAULT_UPDATE_TEMPLATE = `{
 }`
 
 export const DEFAULT_PLAIN_SMS_TEMPLATE = `📱 短信通知
-发送方: {{phone_number}}
+号码: {{phone_number}}
 内容: {{content}}
 时间: {{timestamp}}
-本机号码: {{own_number}}`
+来源: {{own_number}}`
 
 export const DEFAULT_PLAIN_CALL_TEMPLATE = `📞 来电通知
 号码: {{phone_number}}
