@@ -1,0 +1,76 @@
+# Build VoHive from this source collection without fetching private iniwex5 modules.
+
+FROM --platform=$BUILDPLATFORM node:20-alpine AS frontend-builder
+ARG BUILDPLATFORM
+WORKDIR /src/vohive/web
+
+COPY vohive/web/package*.json ./
+RUN --mount=type=cache,target=/root/.npm,id=vohive-npm-${BUILDPLATFORM},sharing=locked \
+    npm ci
+
+COPY vohive/web/ ./
+RUN npm run build
+
+FROM --platform=$BUILDPLATFORM golang:1.24-alpine AS backend-builder
+ARG BUILDPLATFORM
+ARG TARGETOS=linux
+ARG TARGETARCH
+ARG VERSION=source
+ARG BUILDTIME=unknown
+ARG REVISION=unknown
+ARG ENABLE_UPX=0
+
+ENV GOTOOLCHAIN=auto
+ENV GOWORK=/src/go.work
+
+WORKDIR /src
+RUN apk add --no-cache git
+
+COPY go.work go.work.sum ./
+COPY euicc-go/go.mod euicc-go/go.sum ./euicc-go/
+COPY netlink/go.mod netlink/go.sum ./netlink/
+COPY qqbot/go.mod qqbot/go.sum ./qqbot/
+COPY quectel-qmi-go/go.mod quectel-qmi-go/go.sum ./quectel-qmi-go/
+COPY swu-go/go.mod swu-go/go.sum ./swu-go/
+COPY uicc-go/go.mod uicc-go/go.sum ./uicc-go/
+COPY vohive/go.mod vohive/go.sum ./vohive/
+COPY vowifi-go/go.mod vowifi-go/go.sum ./vowifi-go/
+
+RUN --mount=type=cache,target=/go/pkg/mod,id=vohive-gomod-${TARGETOS}-${TARGETARCH},sharing=locked \
+    cd vohive && go mod download
+
+COPY . .
+COPY --from=frontend-builder /src/vohive/web/dist /src/vohive/internal/web/dist
+
+RUN --mount=type=cache,target=/root/.cache/go-build,id=vohive-gobuild-${TARGETOS}-${TARGETARCH},sharing=locked \
+    --mount=type=cache,target=/go/pkg/mod,id=vohive-gomod-${TARGETOS}-${TARGETARCH},sharing=locked \
+    target_os="${TARGETOS:-linux}" && \
+    target_arch="${TARGETARCH:-$(go env GOARCH)}" && \
+    cd vohive && \
+    CGO_ENABLED=0 GOOS="${target_os}" GOARCH="${target_arch}" \
+    go build -trimpath -buildvcs=false -tags "with_utls nomsgpack" \
+      -ldflags "-s -w -X 'github.com/iniwex5/vohive/internal/global.Version=${VERSION}' -X 'github.com/iniwex5/vohive/internal/global.BuildTime=${BUILDTIME}'" \
+      -o /src/vo-hive ./cmd/vohive && \
+    if [ "${ENABLE_UPX}" = "1" ] || [ "${ENABLE_UPX}" = "true" ]; then \
+      (apk add --no-cache upx >/dev/null 2>&1 || apk add --no-cache upx-ucl >/dev/null 2>&1 || true); \
+      if command -v upx >/dev/null 2>&1; then upx --best --lzma /src/vo-hive; fi; \
+    fi && \
+    ls -lh /src/vo-hive
+
+FROM alpine:latest
+ARG REVISION=unknown
+
+WORKDIR /app
+LABEL org.opencontainers.image.source="https://github.com/cilibang123/vohive-collection"
+LABEL org.opencontainers.image.revision=${REVISION}
+
+RUN apk add --no-cache ca-certificates tzdata
+
+COPY --from=backend-builder /src/vo-hive ./vo-hive
+RUN mkdir -p config data logs
+
+EXPOSE 7575
+ENV CONFIG_PATH=/app/config/config.yaml
+
+ENTRYPOINT ["./vo-hive"]
+CMD ["-c", "/app/config/config.yaml"]
