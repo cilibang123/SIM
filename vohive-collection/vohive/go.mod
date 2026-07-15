@@ -112,4 +112,14 @@ require (
 	modernc.org/sqlite v1.23.1 // indirect
 )
 
+replace (
+	github.com/damonto/euicc-go => ../euicc-go
+	github.com/damonto/uicc-go => ../uicc-go
+	github.com/iniwex5/netlink => ../netlink
+	github.com/iniwex5/qqbot => ../qqbot
+	github.com/iniwex5/quectel-qmi-go => ../quectel-qmi-go
+	github.com/iniwex5/swu-go => ../swu-go
+	github.com/iniwex5/vowifi-go => ../vowifi-go
+)
+
 replace github.com/iniwex5/vowifi-go => ../vowifi-go

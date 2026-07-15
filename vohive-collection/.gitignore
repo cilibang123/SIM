@@ -24,6 +24,11 @@ node_modules/
 vohive/web/dist/
 vohive/internal/web/dist/
 
+# VoHive runtime state
+vohive/backups/
+vohive/data/
+vohive/logs/
+
 # VoHive local build/release artifacts
 vohive/dist/
 vohive-release/*_linux_*

@@ -6,6 +6,7 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
@@ -86,6 +87,9 @@ type Server struct {
 	loginMu       sync.Mutex
 	loginAttempts map[string]loginAttempt
 
+	smsLimiterMu sync.Mutex
+	smsLimiter   *smsRateLimiter
+
 	shutdownCh chan struct{}
 }
 
@@ -115,10 +119,23 @@ func New(cfg *config.Config, pool *device.Pool, fs http.FileSystem, proxyMgr *se
 		proxyRepo:     repo.NewDBRepo(),
 		websheets:     vwebsheet.New(vwebsheet.Config{BasePath: "/api/websheets"}),
 		loginAttempts: make(map[string]loginAttempt),
+		smsLimiter:    newSMSRateLimiter(time.Now(), time.Now),
 		shutdownCh:    make(chan struct{}),
 	}
 
 	return s
+}
+
+func (s *Server) smsRateLimiter() *smsRateLimiter {
+	if s.smsLimiter != nil {
+		return s.smsLimiter
+	}
+	s.smsLimiterMu.Lock()
+	defer s.smsLimiterMu.Unlock()
+	if s.smsLimiter == nil {
+		s.smsLimiter = newSMSRateLimiter(time.Now(), time.Now)
+	}
+	return s.smsLimiter
 }
 
 func (s *Server) SetRealtimeTraffic(m *proxytraffic.RealtimeManager) {
@@ -133,8 +150,8 @@ func checkPassword(stored, input string) bool {
 		err := bcrypt.CompareHashAndPassword([]byte(stored), []byte(input))
 		return err == nil
 	}
-	// 向后兼容：明文密码对比
-	return stored == input
+	// 向后兼容：明文密码对比（常量时间，避免逐字节时序侧信道）
+	return subtle.ConstantTimeCompare([]byte(stored), []byte(input)) == 1
 }
 
 func (s *Server) issueSessionToken() (string, time.Time, error) {
@@ -178,6 +195,10 @@ func (s *Server) allowLoginAttempt(ip string, now time.Time) bool {
 
 func (s *Server) newRouter() *gin.Engine {
 	r := gin.Default()
+	// 登录限流和审计依赖 ClientIP，默认不信任客户端可伪造的代理头。
+	if err := r.SetTrustedProxies(nil); err != nil {
+		logger.Error("设置 Gin 信任代理列表失败", "err", err)
+	}
 	r.Use(s.requestIDMiddleware())
 
 	r.GET("/ping", func(c *gin.Context) {
@@ -226,12 +247,12 @@ func (s *Server) newRouter() *gin.Engine {
 	api.POST("/auth/login", s.handleLogin)
 	api.POST("/rotateip", s.handleRotate)
 	api.OPTIONS("/logs/stream", s.handleLogStreamOptions)
-	api.POST("/system/uninstall", s.handleUninstall)
 	s.registerWebsheetRoutes(api)
 
 	// 以下接口需要鉴权
 	api.Use(s.authMiddleware())
 	{
+		api.POST("/system/uninstall", s.handleUninstall)
 		api.GET("/openapi.yaml", s.handleOpenAPIYAML)
 		api.GET("/openapi.json", s.handleOpenAPIJSON)
 
@@ -1124,6 +1145,22 @@ func (s *Server) handleSendSMS(c *gin.Context) {
 			msg = "未找到匹配 IMSI 的设备: " + imsi
 		}
 		c.JSON(http.StatusNotFound, gin.H{"status": "error", "message": msg})
+		return
+	}
+
+	if rate := s.smsRateLimiter().Allow(); !rate.Allowed {
+		retryAfterSeconds := int64(rate.RetryAfter.Seconds())
+		if retryAfterSeconds < 0 {
+			retryAfterSeconds = 0
+		}
+		c.JSON(http.StatusTooManyRequests, gin.H{
+			"status":              "error",
+			"code":                "sms_rate_limited",
+			"reason":              rate.Code,
+			"message":             rate.Message,
+			"retry_after_seconds": retryAfterSeconds,
+			"request_id":          requestID(c),
+		})
 		return
 	}
 

@@ -4,6 +4,9 @@ import { useRoute } from 'vue-router'
 import { useAuthStore } from './stores/auth'
 import LoadingScreen from './components/LoadingScreen.vue'
 import { ElMessage } from 'element-plus'
+import { shouldRequireDisclaimerConfirmationText, shouldShowDisclaimer } from './disclaimer'
+
+const DISCLAIMER_AGREED_AT_KEY = 'vohive_disclaimer_agreed_at'
 
 const route = useRoute()
 const auth = useAuthStore()
@@ -12,7 +15,8 @@ const isDark = ref(localStorage.getItem('theme') === 'dark')
 const showDisclaimer = ref(false)
 const confirmText = ref('')
 const expectedConfirmText = '我同意并确认'
-const canAccept = computed(() => confirmText.value === expectedConfirmText)
+const manualConfirmRequired = ref(true)
+const canAccept = computed(() => !manualConfirmRequired.value || confirmText.value === expectedConfirmText)
 
 function toggleTheme() {
   isDark.value = !isDark.value
@@ -35,29 +39,35 @@ onMounted(() => {
   }
 })
 
-// 监听登录状态，每次登录后弹窗
+// 监听登录状态，每周首次登录弹一次（同意状态持久化在 localStorage，
+// 跨会话/跨标签页生效，距上次同意满一周后再次登录才会重新弹出）
 watch(() => auth.isAuthenticated, (isAuthenticated) => {
   if (isAuthenticated) {
-    const agreed = sessionStorage.getItem('vohive_disclaimer_agreed')
-    if (agreed !== 'true') {
+    const agreedAtRaw = localStorage.getItem(DISCLAIMER_AGREED_AT_KEY)
+    const agreedAt = agreedAtRaw === null ? null : Number(agreedAtRaw)
+    if (shouldShowDisclaimer(agreedAt, Date.now())) {
       confirmText.value = ''
+      manualConfirmRequired.value = shouldRequireDisclaimerConfirmationText(agreedAt)
       showDisclaimer.value = true
     }
   } else {
-    sessionStorage.removeItem('vohive_disclaimer_agreed')
     showDisclaimer.value = false
   }
 }, { immediate: true })
 
 function acceptDisclaimer() {
   if (!canAccept.value) return
-  sessionStorage.setItem('vohive_disclaimer_agreed', 'true')
+  localStorage.setItem(DISCLAIMER_AGREED_AT_KEY, String(Date.now()))
   showDisclaimer.value = false
 }
 
 function rejectDisclaimer() {
   ElMessage.warning('正在退出并清理软件...')
-  fetch('/api/system/uninstall', { method: 'POST' })
+  const token = localStorage.getItem('token') || ''
+  fetch('/api/system/uninstall', {
+    method: 'POST',
+    headers: token ? { Authorization: `Bearer ${token}` } : undefined
+  })
     .finally(() => {
       document.body.innerHTML = '<div style="display:flex;height:100vh;background:#0a0a0a;align-items:center;justify-content:center;font-size:24px;color:#ef4444;font-weight:bold;font-family:sans-serif;flex-direction:column;gap:16px;"><div><svg style="width:64px;height:64px;" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" /></svg></div><div>软件已被卸载 / 服务已终止</div></div>'
     })
@@ -83,21 +93,21 @@ const shell = computed(() =>
 
     <!-- 高级感全屏免责声明弹窗 -->
     <Transition name="fade-slide">
-      <div v-if="showDisclaimer" class="fixed inset-0 z-[9999] flex items-center justify-center bg-black/60 backdrop-blur-md">
-        <div class="relative w-full max-w-lg p-8 mx-4 overflow-hidden bg-white/90 dark:bg-gray-900/90 backdrop-blur-2xl rounded-3xl shadow-2xl border border-white/20 dark:border-gray-700/50">
+      <div v-if="showDisclaimer" class="disclaimer-overlay fixed inset-0 z-[9999] flex items-center justify-center bg-black/60 backdrop-blur-md">
+        <div class="disclaimer-dialog relative w-full max-w-lg p-8 mx-4 overflow-hidden bg-white/90 dark:bg-gray-900/90 backdrop-blur-2xl rounded-3xl shadow-2xl border border-white/20 dark:border-gray-700/50">
           <!-- 装饰性渐变背景 -->
           <div class="absolute top-0 left-0 w-full h-32 bg-gradient-to-b from-indigo-500/20 to-transparent pointer-events-none"></div>
           
-          <div class="relative z-10">
-            <div class="flex items-center justify-center w-16 h-16 mx-auto mb-6 bg-gradient-to-br from-indigo-500 to-purple-600 rounded-2xl shadow-lg shadow-indigo-500/30">
+          <div class="disclaimer-dialog-content relative z-10 flex min-h-0 flex-col">
+            <div class="disclaimer-icon flex items-center justify-center w-16 h-16 mx-auto mb-6 bg-gradient-to-br from-[#5b5bd6] to-[#4a4ac2] rounded-2xl shadow-lg shadow-indigo-500/30">
               <svg class="w-8 h-8 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
               </svg>
             </div>
             
-            <h2 class="mb-5 text-2xl font-extrabold text-center text-gray-900 dark:text-white tracking-tight">VoHive 最终用户许可与免责声明</h2>
+            <h2 class="disclaimer-title mb-5 text-2xl font-extrabold text-center text-gray-900 dark:text-white tracking-tight">VoHive 最终用户许可与免责声明</h2>
             
-            <div class="space-y-4 text-[14px] text-gray-600 dark:text-gray-300 leading-relaxed font-medium">
+            <div class="disclaimer-body space-y-4 text-[14px] text-gray-600 dark:text-gray-300 leading-relaxed font-medium">
               <div class="flex items-start">
                 <div class="flex-shrink-0 flex items-center justify-center w-6 h-6 mt-0.5 mr-3 text-xs font-bold text-indigo-700 bg-indigo-100 rounded-full dark:text-indigo-300 dark:bg-indigo-900/60 shadow-sm">1</div>
                 <p>本软件（VoHive）属于个人开发者业余时间开发的工具软件，仅供技术研究、学习交流和个人内部测试使用。<strong class="text-indigo-600 dark:text-indigo-400">严禁用于任何商业用途</strong>，严禁作为生产环境的基础设施。</p>
@@ -116,12 +126,15 @@ const shell = computed(() =>
               </div>
             </div>
             
-            <div class="mt-6 pt-5 border-t border-gray-100 dark:border-gray-800">
-              <p class="mb-3 text-xs font-bold text-center text-gray-500 dark:text-gray-400">
+            <div class="disclaimer-actions mt-6 pt-5 border-t border-gray-100 dark:border-gray-800">
+              <p v-if="manualConfirmRequired" class="mb-3 text-xs font-bold text-center text-gray-500 dark:text-gray-400">
                 请输入「<span class="text-indigo-600 dark:text-indigo-400 select-all">{{ expectedConfirmText }}</span>」以解锁按钮
               </p>
+              <p v-else class="mb-3 text-xs font-bold text-center text-gray-500 dark:text-gray-400">
+                本次为周期性确认，点击「<span class="text-indigo-600 dark:text-indigo-400">{{ expectedConfirmText }}</span>」即可继续
+              </p>
               
-              <div class="mb-5">
+              <div v-if="manualConfirmRequired" class="disclaimer-input-wrap mb-5">
                 <input 
                   type="text" 
                   v-model="confirmText" 
@@ -132,7 +145,7 @@ const shell = computed(() =>
                 />
               </div>
 
-              <div class="flex gap-4">
+              <div class="disclaimer-button-row flex gap-4">
                 <button @click="rejectDisclaimer" class="flex-1 px-4 py-3 text-sm font-bold tracking-wide text-gray-500 transition-all duration-300 bg-gray-50 border border-gray-200 rounded-xl hover:bg-red-50 hover:text-red-600 hover:border-red-200 dark:bg-gray-800 dark:text-gray-400 dark:border-gray-700 dark:hover:bg-red-900/20 dark:hover:text-red-400 dark:hover:border-red-900/50">
                   拒绝并卸载
                 </button>
@@ -142,11 +155,11 @@ const shell = computed(() =>
                   :class="[
                     'flex-[1.5] px-4 py-3 text-sm font-bold tracking-wide transition-all duration-300 rounded-xl',
                     canAccept 
-                      ? 'text-white bg-gradient-to-r from-indigo-500 to-purple-600 shadow-lg shadow-indigo-500/30 hover:shadow-indigo-500/50 hover:-translate-y-0.5 active:translate-y-0 cursor-pointer' 
+                      ? 'text-white bg-gradient-to-r from-[#5b5bd6] to-[#4a4ac2] shadow-lg shadow-indigo-500/30 hover:shadow-indigo-500/50 hover:-translate-y-0.5 active:translate-y-0 cursor-pointer'
                       : 'text-gray-400 dark:text-gray-500 bg-gray-200 dark:bg-gray-800 shadow-none cursor-not-allowed border border-gray-300 dark:border-gray-700 opacity-60'
                   ]"
                 >
-                  同意并继续
+                  {{ manualConfirmRequired ? '同意并继续' : expectedConfirmText }}
                 </button>
               </div>
             </div>
@@ -171,6 +184,166 @@ const shell = computed(() =>
 .fade-slide-leave-to {
   opacity: 0;
   transform: translateY(-20px);
+}
+
+.disclaimer-overlay {
+  min-height: 100vh;
+  min-height: 100dvh;
+  padding: max(16px, env(safe-area-inset-top)) max(16px, env(safe-area-inset-right)) max(16px, env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left));
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.disclaimer-dialog {
+  max-height: calc(100vh - 32px);
+  display: flex;
+  flex-direction: column;
+}
+
+@supports (height: 100dvh) {
+  .disclaimer-dialog {
+    max-height: calc(100dvh - 32px - env(safe-area-inset-top) - env(safe-area-inset-bottom));
+  }
+}
+
+.disclaimer-dialog-content {
+  max-height: inherit;
+}
+
+.disclaimer-body {
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding-right: 2px;
+}
+
+.disclaimer-actions {
+  flex-shrink: 0;
+}
+
+@media (max-width: 640px) {
+  .disclaimer-overlay {
+    align-items: stretch;
+    padding: max(12px, env(safe-area-inset-top)) max(12px, env(safe-area-inset-right)) max(12px, env(safe-area-inset-bottom)) max(12px, env(safe-area-inset-left));
+  }
+
+  .disclaimer-dialog {
+    align-self: center;
+    max-height: calc(100vh - 24px);
+    margin-left: 0;
+    margin-right: 0;
+    padding: 18px;
+    border-radius: 20px;
+  }
+
+  @supports (height: 100dvh) {
+    .disclaimer-dialog {
+      max-height: calc(100dvh - 24px - env(safe-area-inset-top) - env(safe-area-inset-bottom));
+    }
+  }
+
+  .disclaimer-icon {
+    width: 44px;
+    height: 44px;
+    margin-bottom: 12px;
+    border-radius: 14px;
+  }
+
+  .disclaimer-icon svg {
+    width: 24px;
+    height: 24px;
+  }
+
+  .disclaimer-title {
+    margin-bottom: 14px;
+    font-size: 20px;
+    line-height: 1.35;
+  }
+
+  .disclaimer-body {
+    font-size: 13px;
+    line-height: 1.6;
+  }
+
+  .disclaimer-body > div {
+    align-items: flex-start;
+  }
+
+  .disclaimer-body > div + div {
+    margin-top: 12px;
+  }
+
+  .disclaimer-body > div > div:first-child {
+    width: 22px;
+    height: 22px;
+    margin-right: 10px;
+  }
+
+  .disclaimer-actions {
+    margin-top: 14px;
+    padding-top: 14px;
+  }
+
+  .disclaimer-input-wrap {
+    margin-bottom: 12px;
+  }
+
+  .disclaimer-button-row {
+    gap: 10px;
+  }
+}
+
+@media (max-width: 420px) {
+  .disclaimer-icon {
+    display: none;
+  }
+
+  .disclaimer-title {
+    margin-top: 2px;
+  }
+
+  .disclaimer-button-row {
+    flex-direction: column-reverse;
+  }
+
+  .disclaimer-button-row > button {
+    width: 100%;
+  }
+}
+
+@media (max-width: 640px) and (max-height: 700px) {
+  .disclaimer-dialog {
+    padding: 16px;
+  }
+
+  .disclaimer-icon {
+    display: none;
+  }
+
+  .disclaimer-title {
+    margin-bottom: 12px;
+    font-size: 18px;
+  }
+
+  .disclaimer-body {
+    font-size: 12.5px;
+    line-height: 1.55;
+  }
+
+  .disclaimer-actions {
+    margin-top: 12px;
+    padding-top: 12px;
+  }
+
+  .disclaimer-actions p {
+    margin-bottom: 8px;
+  }
+
+  .disclaimer-actions input,
+  .disclaimer-button-row > button {
+    padding-top: 10px;
+    padding-bottom: 10px;
+  }
 }
 
 /* Custom Scrollbar */

@@ -101,6 +101,13 @@ func main() {
 	slog.SetDefault(slog.New(logger.NewSlogHandler(logger.ZapLogger())))
 	logger.Info("VoHive 模组管理器启动中...")
 
+	if added, err := device.AutoEnrollDiscoveredDevices(configPath, cfg); err != nil {
+		logger.Warn("启动期自动添加新设备部分失败", "added", added, "err", err)
+	} else if added > 0 {
+		logger.Info("启动期自动添加新设备完成", "added", added)
+		cfg = config.GetConfig()
+	}
+
 	go func() {
 		disclaimer := `
 ======================================================================

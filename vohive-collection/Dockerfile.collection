@@ -61,7 +61,7 @@ FROM alpine:latest
 ARG REVISION=unknown
 
 WORKDIR /app
-LABEL org.opencontainers.image.source="https://github.com/cilibang123/vohive-collection"
+LABEL org.opencontainers.image.source="https://github.com/cilibang123/SIM"
 LABEL org.opencontainers.image.revision=${REVISION}
 
 RUN apk add --no-cache ca-certificates tzdata

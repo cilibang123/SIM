@@ -1,15 +1,26 @@
 package db
 
 import (
-	"fmt"
+	"path/filepath"
 	"testing"
 )
 
 func TestCheckSchema(t *testing.T) {
-	Init("/root/.gemini/antigravity/vohive.db")
-	var m []map[string]interface{}
-	DB.Raw("PRAGMA table_info(managed_devices)").Scan(&m)
-	for _, row := range m {
-		fmt.Println(row["name"])
+	if err := Init(filepath.Join(t.TempDir(), "vohive.db")); err != nil {
+		t.Fatalf("initialize test database: %v", err)
+	}
+	if DB == nil {
+		t.Fatal("database was not initialized")
+	}
+
+	if !DB.Migrator().HasTable(&Device{}) {
+		t.Fatal("devices table was not created")
+	}
+	columns, err := DB.Migrator().ColumnTypes(&Device{})
+	if err != nil {
+		t.Fatalf("inspect devices schema: %v", err)
+	}
+	if len(columns) == 0 {
+		t.Fatal("devices schema is empty")
 	}
 }

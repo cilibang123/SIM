@@ -1,6 +1,7 @@
 .git
 .github
 **/.git
+**/._*
 **/node_modules
 **/dist
 **/.cache
