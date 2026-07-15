@@ -1,6 +1,6 @@
-# Aether
+# SIM
 
-Aether 是一个 SIM/eSIM 管理方向的合并源码仓库，当前先以 monorepo
+SIM 是一个 SIM/eSIM 管理方向的合并源码仓库，当前先以 monorepo
 方式收纳两套项目源码：
 
 - `simadmin/`: 从 `3899/SimAdmin` 导入的源码。
